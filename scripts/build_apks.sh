@@ -1,102 +1,160 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Building Production Android APKs with Build-Tools 33.0.2 & Libraries ==="
+echo "=== Building Both Android APKs via Official Gradle Toolchain (AGP 8.1.4 / SDK 34 Android 14 Release v2.6.0) ==="
 
-ANDROID_JAR="/usr/lib/android-sdk/platforms/android-33/android.jar"
-BUILD_TOOLS="/usr/lib/android-sdk/build-tools/33.0.2"
-LIBS="/usr/share/android-libs"
-KEYSTORE="/tmp/debug.keystore"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
-mkdir -p public/downloads
-
-if [ ! -f "$KEYSTORE" ]; then
-    echo "Generating debug keystore..."
-    keytool -genkey -v -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+# 0. Ensure JDK 17, zip, and unzip are available
+if ! command -v javac >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v zip >/dev/null 2>&1; then
+    echo "Installing OpenJDK 17, zip, and unzip..."
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openjdk-17-jdk-headless unzip zip
 fi
 
-# 1. Build Scream Runner APK
-echo "--- Building Scream Runner (com.screamrunner.game) ---"
-rm -rf /tmp/build_runner && mkdir -p /tmp/build_runner/{compiled_res,gen,classes,dex}
+# 1. Resolve or bootstrap Android SDK 34 (Android 14) & Build-Tools 34.0.0
+export ANDROID_HOME="${ANDROID_HOME:-/tmp/android-sdk}"
+mkdir -p "$ANDROID_HOME/licenses" "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
 
-# aapt2 compile resources
-$BUILD_TOOLS/aapt2 compile --dir android/scream-runner/src/main/res -o /tmp/build_runner/compiled_res.zip
+# Accept standard Android SDK licenses
+printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > "$ANDROID_HOME/licenses/android-sdk-license"
 
-# aapt2 link to produce R.java and packaged resources APK
-$BUILD_TOOLS/aapt2 link -I "$ANDROID_JAR" \
-    --manifest android/scream-runner/AndroidManifest.xml \
-    --java /tmp/build_runner/gen \
-    -o /tmp/build_runner/base.apk \
-    /tmp/build_runner/compiled_res.zip \
-    --auto-add-overlay
+if [ ! -d "$ANDROID_HOME/platforms/android-34" ]; then
+    echo "Bootstrapping Android SDK Platform 34 (Android 14)..."
+    curl -sL https://dl.google.com/android/repository/platform-34-ext7_r03.zip -o /tmp/platform-34.zip
+    unzip -q /tmp/platform-34.zip -d "$ANDROID_HOME/platforms/"
+    mv "$ANDROID_HOME/platforms/android-"*34* "$ANDROID_HOME/platforms/android-34" 2>/dev/null || true
+    rm -f /tmp/platform-34.zip
+fi
 
-# Compile Java source code and R.java with OkHttp & Gson dependencies
-javac -source 8 -target 8 \
-    -cp "$ANDROID_JAR:$LIBS/*" \
-    -d /tmp/build_runner/classes \
-    $(find android/scream-runner/src/main/java /tmp/build_runner/gen -name "*.java")
+# Ensure AGP 8.1.4 treats android-34 as base SDK 34
+if [ -f "$ANDROID_HOME/platforms/android-34/source.properties" ]; then
+    sed -i '/AndroidVersion.ExtensionLevel/d' "$ANDROID_HOME/platforms/android-34/source.properties"
+fi
 
-# Dex compilation with d8 incorporating dependencies (OkHttp, Okio, Kotlin-stdlib, Gson)
-$BUILD_TOOLS/d8 --min-api 26 \
-    --output /tmp/build_runner/dex \
-    $LIBS/*.jar \
-    $(find /tmp/build_runner/classes -name "*.class")
+if [ ! -d "$ANDROID_HOME/build-tools/34.0.0" ]; then
+    echo "Bootstrapping Android SDK Build-Tools 34.0.0..."
+    curl -sL https://dl.google.com/android/repository/build-tools_r34-linux.zip -o /tmp/build-tools-34.zip
+    unzip -q /tmp/build-tools-34.zip -d "$ANDROID_HOME/build-tools/"
+    mv "$ANDROID_HOME/build-tools/android-14" "$ANDROID_HOME/build-tools/34.0.0" 2>/dev/null || true
+    rm -f /tmp/build-tools-34.zip
+fi
 
-# Package DEX into APK
-cp /tmp/build_runner/base.apk /tmp/build_runner/unaligned.apk
-(cd /tmp/build_runner/dex && zip -u /tmp/build_runner/unaligned.apk classes*.dex)
+if [ ! -d "$ANDROID_HOME/platform-tools" ]; then
+    echo "Bootstrapping Android SDK Platform-Tools..."
+    curl -sL https://dl.google.com/android/repository/platform-tools-latest-linux.zip -o /tmp/platform-tools.zip
+    unzip -q /tmp/platform-tools.zip -d "$ANDROID_HOME/"
+    rm -f /tmp/platform-tools.zip
+fi
 
-# 4-byte page align
-$BUILD_TOOLS/zipalign -f -p 4 /tmp/build_runner/unaligned.apk /tmp/build_runner/aligned.apk
+echo "Using ANDROID_HOME=$ANDROID_HOME"
 
-# Sign with apksigner (v2 and v3 signatures)
-$BUILD_TOOLS/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
-    --out public/downloads/scream-runner.apk /tmp/build_runner/aligned.apk
+# 2. Generate Two Separate Production Release Keystores (2048-bit RSA)
+RUNNER_KEYSTORE="/tmp/scream-runner-v26-release.jks"
+if [ ! -f "$RUNNER_KEYSTORE" ]; then
+    echo "Generating Scream Runner v2.6.0 Release Keystore..."
+    keytool -genkeypair -v \
+        -keystore "$RUNNER_KEYSTORE" \
+        -alias runner_v26 \
+        -keyalg RSA \
+        -keysize 2048 \
+        -validity 10000 \
+        -storepass runnerrelease2026 \
+        -keypass runnerrelease2026 \
+        -dname "CN=ScreamRunner Arcade Studio, OU=Interactive Gaming, O=ScreamRunner Entertainment, L=Austin, ST=TX, C=US"
+fi
 
-echo "Verified scream-runner.apk:"
-$BUILD_TOOLS/apksigner verify -v public/downloads/scream-runner.apk
-$BUILD_TOOLS/aapt dump badging public/downloads/scream-runner.apk | head -n 8
+DASH_KEYSTORE="/tmp/sams-console-v26-release.jks"
+if [ ! -f "$DASH_KEYSTORE" ]; then
+    echo "Generating Sam's Dashboard v2.6.0 Release Keystore..."
+    keytool -genkeypair -v \
+        -keystore "$DASH_KEYSTORE" \
+        -alias console_v26 \
+        -keyalg RSA \
+        -keysize 2048 \
+        -validity 10000 \
+        -storepass dashboardrelease2026 \
+        -keypass dashboardrelease2026 \
+        -dname "CN=Sams Acoustic Telemetry, OU=Audio Engineering, O=Sams Telemetry Lab, L=Seattle, ST=WA, C=US"
+fi
 
-# 2. Build Sam's Dashboard APK
-echo "--- Building Sam's Dashboard (com.samsdashboard.admin) ---"
-rm -rf /tmp/build_dashboard && mkdir -p /tmp/build_dashboard/{compiled_res,gen,classes,dex}
+# 3. Run Gradle Release Build with isolated /tmp caches
+chmod +x "$ROOT_DIR/android/gradlew"
+rm -rf "$ROOT_DIR/android/.gradle" "$ROOT_DIR/android/build" "$ROOT_DIR/android/scream-runner/build" "$ROOT_DIR/android/sams-dashboard/build" "$ROOT_DIR/android/local.properties" /tmp/android-build
 
-# aapt2 compile resources
-$BUILD_TOOLS/aapt2 compile --dir android/sams-dashboard/src/main/res -o /tmp/build_dashboard/compiled_res.zip
+echo "--- Running Gradle :scream-runner:assembleRelease :sams-dashboard:assembleRelease ---"
+"$ROOT_DIR/android/gradlew" -p "$ROOT_DIR/android" \
+    --project-cache-dir /tmp/gradle-project-cache \
+    :scream-runner:assembleRelease \
+    :sams-dashboard:assembleRelease \
+    --no-daemon --console=plain
 
-# aapt2 link to produce R.java and base APK
-$BUILD_TOOLS/aapt2 link -I "$ANDROID_JAR" \
-    --manifest android/sams-dashboard/AndroidManifest.xml \
-    --java /tmp/build_dashboard/gen \
-    -o /tmp/build_dashboard/base.apk \
-    /tmp/build_dashboard/compiled_res.zip \
-    --auto-add-overlay
+# Remove any residual .gradle or local.properties so workspace stays clean
+rm -rf "$ROOT_DIR/android/.gradle" "$ROOT_DIR/android/build" "$ROOT_DIR/android/scream-runner/build" "$ROOT_DIR/android/sams-dashboard/build" "$ROOT_DIR/android/local.properties"
 
-# Compile Java source code and R.java
-javac -source 8 -target 8 \
-    -cp "$ANDROID_JAR:$LIBS/*" \
-    -d /tmp/build_dashboard/classes \
-    $(find android/sams-dashboard/src/main/java /tmp/build_dashboard/gen -name "*.java")
+# 4. Strip unprotected AGP META-INF metadata, Align (4-byte page-aligned), and Sign ONCE with v1 + v2 + v3
+mkdir -p "$ROOT_DIR/public/downloads"
 
-# Dex compilation with d8
-$BUILD_TOOLS/d8 --min-api 26 \
-    --output /tmp/build_dashboard/dex \
-    $LIBS/*.jar \
-    $(find /tmp/build_dashboard/classes -name "*.class")
+RUNNER_UNSIGNED="/tmp/android-build/scream-runner/outputs/apk/release/scream-runner-release-unsigned.apk"
+DASH_UNSIGNED="/tmp/android-build/sams-dashboard/outputs/apk/release/sams-dashboard-release-unsigned.apk"
 
-# Package DEX into APK
-cp /tmp/build_dashboard/base.apk /tmp/build_dashboard/unaligned.apk
-(cd /tmp/build_dashboard/dex && zip -u /tmp/build_dashboard/unaligned.apk classes*.dex)
+BUILD_TOOLS_DIR="$ANDROID_HOME/build-tools/34.0.0"
+if [ ! -d "$BUILD_TOOLS_DIR" ]; then
+    BUILD_TOOLS_DIR="$(ls -d "$ANDROID_HOME/build-tools/"* | tail -n 1)"
+fi
+ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+AAPT="$BUILD_TOOLS_DIR/aapt"
 
-# Align & Sign
-$BUILD_TOOLS/zipalign -f -p 4 /tmp/build_dashboard/unaligned.apk /tmp/build_dashboard/aligned.apk
-$BUILD_TOOLS/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
-    --out public/downloads/sams-dashboard.apk /tmp/build_dashboard/aligned.apk
+# Remove unprotected META-INF/com/android/build/gradle/app-metadata.properties before signing
+zip -q -d "$RUNNER_UNSIGNED" "META-INF/*" 2>/dev/null || true
+zip -q -d "$DASH_UNSIGNED" "META-INF/*" 2>/dev/null || true
 
-echo "Verified sams-dashboard.apk:"
-$BUILD_TOOLS/apksigner verify -v public/downloads/sams-dashboard.apk
-$BUILD_TOOLS/aapt dump badging public/downloads/sams-dashboard.apk | head -n 8
+"$ZIPALIGN" -p -f 4 "$RUNNER_UNSIGNED" "/tmp/scream-runner-aligned.apk"
+"$APKSIGNER" sign \
+    --ks "$RUNNER_KEYSTORE" \
+    --ks-key-alias runner_v26 \
+    --ks-pass pass:runnerrelease2026 \
+    --key-pass pass:runnerrelease2026 \
+    --min-sdk-version 21 \
+    --v1-signing-enabled true \
+    --v2-signing-enabled true \
+    --v3-signing-enabled true \
+    --v4-signing-enabled false \
+    --out "$ROOT_DIR/public/downloads/scream-runner.apk" \
+    "/tmp/scream-runner-aligned.apk"
 
-echo "=== BUILD COMPLETE ==="
-ls -lh public/downloads/*.apk
-sha256sum public/downloads/*.apk
+"$ZIPALIGN" -p -f 4 "$DASH_UNSIGNED" "/tmp/sams-dashboard-aligned.apk"
+"$APKSIGNER" sign \
+    --ks "$DASH_KEYSTORE" \
+    --ks-key-alias console_v26 \
+    --ks-pass pass:dashboardrelease2026 \
+    --key-pass pass:dashboardrelease2026 \
+    --min-sdk-version 21 \
+    --v1-signing-enabled true \
+    --v2-signing-enabled true \
+    --v3-signing-enabled true \
+    --v4-signing-enabled false \
+    --out "$ROOT_DIR/public/downloads/sams-dashboard.apk" \
+    "/tmp/sams-dashboard-aligned.apk"
+
+rm -f /tmp/scream-runner-aligned.apk /tmp/sams-dashboard-aligned.apk "$ROOT_DIR/public/downloads/"*.idsig
+
+# 5. Verify Zipalign, APK Signatures (v1 + v2 + v3 with zero warnings), and Badging
+echo "--- Verifying 4-Byte Zipalign ---"
+"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/scream-runner.apk" && echo "scream-runner.apk zipalign: OK"
+"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/sams-dashboard.apk" && echo "sams-dashboard.apk zipalign: OK"
+
+echo "--- Verifying APK Signatures (v1 + v2 + v3) ---"
+"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/scream-runner.apk"
+"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/sams-dashboard.apk"
+
+echo "--- Inspecting Scream Runner Release Badging ---"
+"$AAPT" dump badging "$ROOT_DIR/public/downloads/scream-runner.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
+
+echo "--- Inspecting Sam's Dashboard Release Badging ---"
+"$AAPT" dump badging "$ROOT_DIR/public/downloads/sams-dashboard.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
+
+echo "=== GRADLE RELEASE BUILD COMPLETE ==="
+ls -lh "$ROOT_DIR/public/downloads/"*.apk
+sha256sum "$ROOT_DIR/public/downloads/"*.apk

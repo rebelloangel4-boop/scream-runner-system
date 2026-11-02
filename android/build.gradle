@@ -13,4 +13,5 @@ allprojects {
         google()
         mavenCentral()
     }
+    buildDir = file("/tmp/android-build/${project.name}")
 }

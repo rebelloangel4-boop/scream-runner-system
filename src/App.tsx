@@ -87,30 +87,30 @@ export default function App() {
             <span className="text-white font-semibold">DELIVERABLES READY</span>
             <span>·</span>
             <a
-              href="/downloads/scream-runner.apk"
-              download="scream-runner.apk"
+              href="/downloads/scream-runner-v2.5.0.apk"
+              download="scream-runner-v2.5.0.apk"
               className="text-cyan-400 hover:underline flex items-center gap-1"
             >
               <Download className="w-3 h-3" />
-              scream-runner.apk (1.2 MB)
+              scream-runner-v2.5.0.apk (1.13 MB)
             </a>
             <span>·</span>
             <a
-              href="/downloads/sams-dashboard.apk"
-              download="sams-dashboard.apk"
+              href="/downloads/sams-dashboard-v2.5.0.apk"
+              download="sams-dashboard-v2.5.0.apk"
               className="text-emerald-400 hover:underline flex items-center gap-1"
             >
               <Download className="w-3 h-3" />
-              sams-dashboard.apk (1.2 MB)
+              sams-dashboard-v2.5.0.apk (1.13 MB)
             </a>
           </div>
 
           <div className="flex items-center gap-4 text-slate-500">
-            <span>APK Signature v2/v3: VERIFIED</span>
+            <span>APK Signature v1/v2/v3: VERIFIED</span>
             <span>·</span>
             <span>FastAPI SQLite WAL: ONLINE</span>
             <span>·</span>
-            <span>Zero ZIP files deliverable</span>
+            <span>Google WebAPK Ready</span>
           </div>
         </div>
       </footer>

@@ -23,7 +23,7 @@ export const DashboardView: React.FC = () => {
   // Auth state
   const [authToken, setAuthToken] = useState<string | null>(localStorage.getItem('admin_jwt'));
   const [username, setUsername] = useState<string>('admin');
-  const [password, setPassword] = useState<string>('');
+  const [password, setPassword] = useState<string>('screamrunner2026!');
   const [showLoginModal, setShowLoginModal] = useState<boolean>(false);
   const [loginError, setLoginError] = useState<string | null>(null);
 
@@ -68,6 +68,7 @@ export const DashboardView: React.FC = () => {
         const data = await res.json();
         setAuthToken(data.access_token);
         localStorage.setItem('admin_jwt', data.access_token);
+        setShowLoginModal(false);
         fetchInitialData();
       } else {
         const err = await res.json();
@@ -92,17 +93,28 @@ export const DashboardView: React.FC = () => {
   };
 
   // 2. Fetch Data
+  const getAuthHeaders = (): HeadersInit => {
+    const token = localStorage.getItem('admin_jwt') || authToken;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
   const fetchInitialData = async () => {
     try {
+      const headers = getAuthHeaders();
       // Fetch devices
-      const devRes = await fetch('/api/v1/devices');
+      let devRes = await fetch('/api/v1/devices', { headers });
+      if (devRes.status === 401) {
+        localStorage.removeItem('admin_jwt');
+        setAuthToken(null);
+        devRes = await fetch('/api/v1/devices');
+      }
       if (devRes.ok) {
         const d = await devRes.json();
         setDevices(d.devices || []);
       }
 
       // Fetch sessions
-      const sessRes = await fetch('/api/v1/sessions');
+      const sessRes = await fetch('/api/v1/sessions', { headers: getAuthHeaders() });
       if (sessRes.ok) {
         const s = await sessRes.json();
         setSessions(s.sessions || []);
@@ -251,7 +263,10 @@ export const DashboardView: React.FC = () => {
 
   const handleDeleteSegment = async (segId: string) => {
     try {
-      const res = await fetch(`/api/v1/audio/${segId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/v1/audio/${segId}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
       if (res.ok) {
         setSegments((prev) => prev.filter((s) => s.id !== segId));
         if (selectedSegment?.id === segId) {

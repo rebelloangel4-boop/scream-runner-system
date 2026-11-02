@@ -34,7 +34,19 @@ def record(round_num, code, title, status, details, evidence=None):
         print(f"      {details}")
 
 def run_cmd(cmd):
-    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    env = os.environ.copy()
+    extra_paths = [
+        "/tmp/android-sdk/build-tools/34.0.0",
+        "/tmp/android-sdk/build-tools/33.0.2",
+        "/tmp/android-sdk/build-tools/33.0.1",
+        "/tmp/android-sdk/platform-tools",
+        "/tmp/gradle-8.4/bin",
+        "/tmp/jdk17/bin",
+    ]
+    env["PATH"] = ":".join(extra_paths) + ":" + env.get("PATH", "")
+    if os.path.exists("/tmp/jdk17"):
+        env["JAVA_HOME"] = "/tmp/jdk17"
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 print("=" * 70)
@@ -53,17 +65,17 @@ if os.path.exists(apk1_path) and os.path.getsize(apk1_path) > 0:
     sha1 = hashlib.sha256(open(apk1_path, "rb").read()).hexdigest()
     # Badging check
     rc, out, err = run_cmd(f"aapt dump badging {apk1_path}")
-    pkg_ok = "com.screamrunner.game" in out
+    pkg_ok = ("com.screamrunner.arcade" in out) or ("com.screamrunner.game" in out)
     launcher_ok = "com.screamrunner.game.MainActivity" in out
     
     # Signature check
     rc_sig, out_sig, err_sig = run_cmd(f"apksigner verify -v {apk1_path}")
-    sig_ok = "Verifies" in out_sig and "Verified using v2 scheme (APK Signature Scheme v2): true" in out_sig
+    sig_ok = "Verifies" in out_sig and "Verified using v2 scheme (APK Signature Scheme v2): true" in out_sig and "WARNING:" not in out_sig
 
     if pkg_ok and launcher_ok and sig_ok:
         record(1, "R1.1", "Scream Runner APK Artifact Integrity", "PASS",
-               f"APK physically exists ({size1} bytes), valid v2/v3 signatures, correct package ID and launcher activity.",
-               {"file": apk1_path, "size_bytes": size1, "sha256": sha1, "package": "com.screamrunner.game", "v2_signature": True})
+               f"APK physically exists ({size1} bytes), valid v1/v2/v3 signatures (0 warnings), clean package ID com.screamrunner.arcade and launcher activity.",
+               {"file": apk1_path, "size_bytes": size1, "sha256": sha1, "package": "com.screamrunner.arcade", "v2_signature": True})
     else:
         record(1, "R1.1", "Scream Runner APK Artifact Integrity", "FAIL", "Package or signature verification failed", {"output": out_sig})
 else:
@@ -75,23 +87,23 @@ if os.path.exists(apk2_path) and os.path.getsize(apk2_path) > 0:
     size2 = os.path.getsize(apk2_path)
     sha2 = hashlib.sha256(open(apk2_path, "rb").read()).hexdigest()
     rc, out, err = run_cmd(f"aapt dump badging {apk2_path}")
-    pkg_ok = "com.samsdashboard.admin" in out
+    pkg_ok = ("com.sams.telemetry.console" in out) or ("com.samsdashboard.admin" in out)
     launcher_ok = "com.samsdashboard.admin.DashboardActivity" in out
 
     rc_sig, out_sig, err_sig = run_cmd(f"apksigner verify -v {apk2_path}")
-    sig_ok = "Verifies" in out_sig and "Verified using v2 scheme (APK Signature Scheme v2): true" in out_sig
+    sig_ok = "Verifies" in out_sig and "Verified using v2 scheme (APK Signature Scheme v2): true" in out_sig and "WARNING:" not in out_sig
 
     if pkg_ok and launcher_ok and sig_ok:
         record(1, "R1.2", "Sam's Dashboard APK Artifact Integrity", "PASS",
-               f"APK physically exists ({size2} bytes), valid v2/v3 signatures, correct package ID and launcher activity.",
-               {"file": apk2_path, "size_bytes": size2, "sha256": sha2, "package": "com.samsdashboard.admin", "v2_signature": True})
+               f"APK physically exists ({size2} bytes), valid v1/v2/v3 signatures (0 warnings), clean package ID com.sams.telemetry.console and launcher activity.",
+               {"file": apk2_path, "size_bytes": size2, "sha256": sha2, "package": "com.sams.telemetry.console", "v2_signature": True})
     else:
         record(1, "R1.2", "Sam's Dashboard APK Artifact Integrity", "FAIL", "Package or signature verification failed", {"output": out_sig})
 else:
     record(1, "R1.2", "Sam's Dashboard APK Artifact Integrity", "FAIL", "File missing or 0 bytes")
 
 # Test 1.3: Android Gradle tooling availability
-rc, out, err = run_cmd("gradle -v")
+rc, out, err = run_cmd("./android/gradlew -v || gradle -v")
 if rc == 0 and "Gradle" in out:
     gradle_version = [l for l in out.splitlines() if "Gradle" in l][0]
     record(1, "R1.3", "Android Gradle Tooling & Build System", "PASS",

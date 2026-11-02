@@ -3,7 +3,7 @@ import { createServer as createViteServer } from 'vite';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import http from 'http';
 import fs from 'fs';
 
@@ -18,6 +18,14 @@ let pythonProcess: ChildProcess | null = null;
 
 function startPythonBackend() {
   const backendScript = path.resolve(__dirname, 'backend', 'main.py');
+  const reqFile = path.resolve(__dirname, 'backend', 'requirements.txt');
+
+  const checkFastApi = spawnSync('python3', ['-c', 'import fastapi, uvicorn, multipart, jwt'], { stdio: 'ignore' });
+  if (checkFastApi.status !== 0 && fs.existsSync(reqFile)) {
+    console.log('[Backend Bridge] Installing FastAPI Python dependencies...');
+    spawnSync('pip3', ['install', '--break-system-packages', '-q', '-r', reqFile], { stdio: 'inherit' });
+  }
+
   console.log(`[Backend Bridge] Starting FastAPI backend on port ${PYTHON_PORT}...`);
 
   pythonProcess = spawn('python3', [backendScript], {
@@ -50,24 +58,32 @@ async function main() {
   const app = express();
   const server = http.createServer(app);
 
-  // Serve direct APK downloads with full Android Chrome headers
+  // Serve direct APK downloads with full Android Chrome headers and zero caching of stale builds
   const downloadsDir = path.resolve(__dirname, 'public', 'downloads');
   app.get(['/downloads/:filename', '/api/v1/downloads/:filename'], (req, res) => {
-    const filename = req.params.filename;
-    if (filename !== 'scream-runner.apk' && filename !== 'sams-dashboard.apk') {
+    const requested = req.params.filename;
+    let diskFilename = requested;
+    if (requested.startsWith('scream-runner') && requested.endsWith('.apk')) {
+      diskFilename = 'scream-runner.apk';
+    } else if (requested.startsWith('sams-dashboard') && requested.endsWith('.apk')) {
+      diskFilename = 'sams-dashboard.apk';
+    } else {
       return res.status(404).send('APK file not found');
     }
-    const filePath = path.join(downloadsDir, filename);
+
+    const filePath = path.join(downloadsDir, diskFilename);
 
     if (fs.existsSync(filePath)) {
       const stat = fs.statSync(filePath);
       res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Disposition', `attachment; filename="${requested}"`);
       res.setHeader('Content-Length', stat.size);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
       res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
       res.setHeader('Accept-Ranges', 'bytes');
       return res.sendFile(filePath);
     }

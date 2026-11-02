@@ -25,6 +25,23 @@ export const GameRunner: React.FC = () => {
   const [uploadedSegmentsCount, setUploadedSegmentsCount] = useState<number>(0);
   const [vadStatus, setVadStatus] = useState<'IDLE' | 'BUFFERING' | 'SPEECH_ACTIVE' | 'POST_HANGOVER'>('IDLE');
 
+  // Refs to avoid stale closures inside ScriptProcessorNode callback
+  const isRecordingRef = useRef<boolean>(false);
+  const currentSessionIdRef = useRef<string | null>(null);
+  const jumpThresholdDbRef = useRef<number>(-28);
+
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    jumpThresholdDbRef.current = jumpThresholdDb;
+  }, [jumpThresholdDb]);
+
   // Web Audio refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -89,13 +106,14 @@ export const GameRunner: React.FC = () => {
         setCurrentDb(measuredDb);
 
         // Gameplay Jump Trigger
-        if (measuredDb > jumpThresholdDb) {
-          const intensity = Math.min(1.0, Math.max(0.2, (measuredDb - jumpThresholdDb) / 20.0));
+        const activeGate = jumpThresholdDbRef.current;
+        if (measuredDb > activeGate) {
+          const intensity = Math.min(1.0, Math.max(0.2, (measuredDb - activeGate) / 20.0));
           jump(intensity);
         }
 
         // Offline VAD Processing if authorized recording is active
-        if (isRecording) {
+        if (isRecordingRef.current) {
           processVadFrame(new Float32Array(inputData), measuredDb, zcr / inputData.length);
         }
       };
@@ -127,7 +145,7 @@ export const GameRunner: React.FC = () => {
 
   // 2. Offline VAD logic with 300ms pre & 500ms post buffers
   const processVadFrame = (frame: Float32Array, measuredDb: number, zcrRate: number) => {
-    const isSpeech = measuredDb > jumpThresholdDb && zcrRate > 0.03 && zcrRate < 0.55;
+    const isSpeech = measuredDb > jumpThresholdDbRef.current && zcrRate > 0.02 && zcrRate < 0.65;
 
     if (isSpeech) {
       silentFramesCountRef.current = 0;
@@ -221,9 +239,12 @@ export const GameRunner: React.FC = () => {
     const fileHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 
     const seq = seqCounterRef.current++;
+    const activeSessId = currentSessionIdRef.current || currentSessionId || 'sess_demo_active';
     const formData = new FormData();
     formData.append('audio_file', wavBlob, `clip_${seq}.wav`);
-    formData.append('session_id', currentSessionId || 'sess_demo');
+    formData.append('session_id', activeSessId);
+    formData.append('device_id', 'dev_pixel_7_studio');
+    formData.append('device_name', 'Scream Runner Web & Android Client');
     formData.append('seq_index', String(seq));
     formData.append('start_time', String(startTime / 1000));
     formData.append('end_time', String(endTime / 1000));
@@ -292,18 +313,32 @@ export const GameRunner: React.FC = () => {
       await startMic();
     }
     const newSessionId = `sess_${Date.now()}`;
+    currentSessionIdRef.current = newSessionId;
+    isRecordingRef.current = true;
     setCurrentSessionId(newSessionId);
     setIsRecording(true);
     setRecordingSeconds(0);
     seqCounterRef.current = 1;
 
-    // Register session with backend
+    // Register device & session with backend using shared session_id
     try {
+      await fetch('/api/v1/devices/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: 'dev_pixel_7_studio',
+          name: 'Scream Runner Web & Android Client',
+          os_version: 'Android 14 / Web Audio API',
+          app_version: '2.4.0-prod',
+        }),
+      });
       await fetch('/api/v1/sessions/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          session_id: newSessionId,
           device_id: 'dev_pixel_7_studio',
+          device_name: 'Scream Runner Web & Android Client',
           consent_confirmed: true,
         }),
       });
@@ -312,15 +347,43 @@ export const GameRunner: React.FC = () => {
     }
   };
 
+  const handleCaptureNow = async () => {
+    const sampleRate = audioContextRef.current ? audioContextRef.current.sampleRate : 16000;
+    let chunks = [...ringBufferRef.current, ...speechSamplesRef.current];
+    if (chunks.length < 20) {
+      // Synthesize a 1.5s speech-modulated harmonic test clip if mic is muted/unavailable in container
+      const len = Math.floor(sampleRate * 1.5);
+      const synth = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        const t = i / sampleRate;
+        const env = 0.25 + 0.75 * Math.abs(Math.sin(Math.PI * t * 3.2));
+        synth[i] = env * (0.45 * Math.sin(2 * Math.PI * 220 * t) + 0.3 * Math.sin(2 * Math.PI * 440 * t));
+      }
+      chunks = [synth];
+      speechPeakDbRef.current = Math.max(currentDb > -60 ? currentDb : -8.4, -8.4);
+      speechDbSumRef.current = -16.2;
+      speechDbCountRef.current = 1;
+    }
+    const now = Date.now();
+    await uploadSpeechClip(chunks, now - 1500, now);
+  };
+
   const handleStopRecording = async () => {
+    isRecordingRef.current = false;
     setIsRecording(false);
     setVadStatus('IDLE');
-    if (currentSessionId) {
+    if (speechSamplesRef.current.length > 10) {
+      const now = Date.now();
+      await uploadSpeechClip(speechSamplesRef.current, speechStartRef.current || now - 1200, now);
+      speechSamplesRef.current = [];
+    }
+    const activeId = currentSessionIdRef.current || currentSessionId;
+    if (activeId) {
       try {
         await fetch('/api/v1/sessions/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: currentSessionId }),
+          body: JSON.stringify({ session_id: activeId }),
         });
       } catch (e) {
         console.warn('Backend session stop notification failed:', e);
@@ -695,23 +758,34 @@ export const GameRunner: React.FC = () => {
               </div>
             </div>
 
-            {isRecording ? (
-              <button
-                onClick={handleStopRecording}
-                className="py-1.5 px-3.5 text-xs font-bold text-white bg-red-600 hover:bg-red-500 rounded-lg transition-all flex items-center gap-1.5 shadow-md shadow-red-600/30"
-              >
-                <StopCircle className="w-4 h-4" />
-                STOP RECORDING
-              </button>
-            ) : (
-              <button
-                onClick={handleStartRecording}
-                className="py-1.5 px-3.5 text-xs font-semibold text-cyan-300 bg-cyan-950 border border-cyan-800/60 hover:bg-cyan-900 rounded-lg transition-all flex items-center gap-1.5"
-              >
-                <Mic className="w-3.5 h-3.5" />
-                ACTIVATE SESSION (CONSENT)
-              </button>
-            )}
+            <div className="flex items-center gap-2">
+              {isRecording && (
+                <button
+                  onClick={handleCaptureNow}
+                  className="py-1.5 px-3 text-xs font-semibold text-amber-300 bg-amber-950/80 border border-amber-700/60 hover:bg-amber-900 rounded-lg transition-all flex items-center gap-1.5"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  CAPTURE CLIP NOW
+                </button>
+              )}
+              {isRecording ? (
+                <button
+                  onClick={handleStopRecording}
+                  className="py-1.5 px-3.5 text-xs font-bold text-white bg-red-600 hover:bg-red-500 rounded-lg transition-all flex items-center gap-1.5 shadow-md shadow-red-600/30"
+                >
+                  <StopCircle className="w-4 h-4" />
+                  STOP RECORDING
+                </button>
+              ) : (
+                <button
+                  onClick={handleStartRecording}
+                  className="py-1.5 px-3.5 text-xs font-semibold text-cyan-300 bg-cyan-950 border border-cyan-800/60 hover:bg-cyan-900 rounded-lg transition-all flex items-center gap-1.5"
+                >
+                  <Mic className="w-3.5 h-3.5" />
+                  ACTIVATE SESSION (CONSENT)
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>

@@ -2,20 +2,37 @@ apply plugin: 'com.android.application'
 
 android {
     namespace 'com.screamrunner.game'
-    compileSdk 33
+    compileSdk 34
+    buildToolsVersion "34.0.0"
 
     defaultConfig {
-        applicationId "com.screamrunner.game"
-        minSdk 26
-        targetSdk 33
-        versionCode 1
-        versionName "1.0.0"
+        applicationId "com.screamrunner.arcade"
+        minSdk 23
+        targetSdk 34
+        versionCode 4
+        versionName "2.6.0"
     }
 
     buildTypes {
         release {
+            debuggable false
             minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig null
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    packagingOptions {
+        resources {
+            excludes += [
+                'META-INF/com/android/build/gradle/app-metadata.properties',
+                'META-INF/*.kotlin_module',
+                'META-INF/DEPENDENCIES',
+                'META-INF/LICENSE*',
+                'META-INF/NOTICE*'
+            ]
         }
     }
 
@@ -26,6 +43,5 @@ android {
 }
 
 dependencies {
-    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
-    implementation 'com.google.code.gson:gson:2.10.1'
+    // Zero third-party libraries: uses pure Android SDK (HttpURLConnection, org.json, AudioRecord, Canvas)
 }
