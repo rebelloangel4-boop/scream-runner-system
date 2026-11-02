@@ -1,0 +1,4 @@
+rootProject.name = 'scream-runner-platform'
+include ':scream-runner', ':sams-dashboard'
+project(':scream-runner').projectDir = file('scream-runner')
+project(':sams-dashboard').projectDir = file('sams-dashboard')

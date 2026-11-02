@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sam\'s Dashboard</string>
+    <string name="title_login">Administrator Login</string>
+    <string name="title_dashboard">Sam\'s Dashboard — Live Audio Monitor</string>
+    <string name="btn_login">AUTHENTICATE</string>
+    <string name="hint_username">Administrator Username</string>
+    <string name="hint_password">Security Token / Password</string>
+    <string name="status_connected">CONNECTED · Pixel 7 Pro (Active Recording) · WebSocket Live</string>
+    <string name="btn_play">PLAY DEMO CLIP</string>
+    <string name="btn_download">DOWNLOAD CLIP</string>
+    <string name="speed_1x">SPEED: 1.0x</string>
+</resources>

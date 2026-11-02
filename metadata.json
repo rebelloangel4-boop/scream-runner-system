@@ -1,0 +1,10 @@
+{
+  "name": "Scream Runner & Sam's Dashboard",
+  "description": "Voice-controlled cyberpunk 2D endless runner with authorized smart audio recording and Sam's administrative monitoring dashboard.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
