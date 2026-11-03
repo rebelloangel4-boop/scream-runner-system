@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-apks:
@@ -25,13 +25,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK Platform 34 & Build-Tools 34.0.0
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          echo "y" | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
 
       - name: Build Both Standalone Release APKs with Gradle
         run: |
@@ -52,20 +49,3 @@ jobs:
           path: public/downloads/sams-dashboard.apk
           if-no-files-found: error
 
-      - name: Publish Direct Downloadable APKs to GitHub Releases
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest-apk-build
-          name: "Latest Android 14 (SDK 34) Release Builds (Scream Runner & Sam's Dashboard)"
-          body: |
-            ### Direct Android Phone APK Downloads (Android 14 / SDK 34 Release Builds)
-            Tap either file below in **Android Chrome** to download the raw `.apk` directly (signed with v1 + v2 + v3 Release signatures):
-            1. **`scream-runner.apk`** — Scream Runner 2D Voice-Controlled Cyberpunk Game (`com.screamrunner.game`, v2.5.0, targetSdk 34)
-            2. **`sams-dashboard.apk`** — Sam's Dashboard Admin Console (`com.samsdashboard.admin`, v2.5.0, targetSdk 34)
-          prerelease: false
-          files: |
-            public/downloads/scream-runner.apk
-            public/downloads/sams-dashboard.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
