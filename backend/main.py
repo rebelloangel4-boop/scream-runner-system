@@ -30,21 +30,11 @@ SECRET_FILE = STORAGE_DIR / ".admin_secret"
 DEFAULT_ADMIN_PASS = "screamrunner2026!"
 
 def load_or_generate_secret() -> str:
-    if "ADMIN_PASSWORD" in os.environ and os.environ["ADMIN_PASSWORD"]:
-        return os.environ["ADMIN_PASSWORD"]
-    if SECRET_FILE.exists():
-        try:
-            val = SECRET_FILE.read_text().strip()
-            if val:
-                return val
-        except Exception:
-            pass
-    try:
-        SECRET_FILE.write_text(DEFAULT_ADMIN_PASS)
-        os.chmod(SECRET_FILE, 0o600)
-    except Exception:
-        pass
-    return DEFAULT_ADMIN_PASS
+    # Fail closed: no known default or on-disk plaintext password fallback.
+    password = os.environ.get("ADMIN_PASSWORD", "")
+    if len(password) < 16:
+        raise RuntimeError("ADMIN_PASSWORD must be set to a unique value of at least 16 characters")
+    return password
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 if len(JWT_SECRET) < 32:
