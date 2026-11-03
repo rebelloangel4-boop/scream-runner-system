@@ -19,7 +19,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         {/* Zone 1: Wordmark */}
         <div className="flex items-center gap-3 shrink-0">
           <a href="/" className="text-sm lg:text-base font-bold tracking-tight text-white whitespace-nowrap hover:text-cyan-400 transition-colors">
-            Scream Runner & Sam's Dashboard
+            Scream Runner &amp; Sam&apos;s Dashboard v3.0
           </a>
           <span
             className={`hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono font-medium ${
@@ -28,7 +28,7 @@ export const TopBar: React.FC<TopBarProps> = ({
             title="Backend API & WebSocket Bus"
           >
             <span className={`w-1.5 h-1.5 rounded-full ${backendOnline ? 'bg-emerald-400' : 'bg-red-400 animate-pulse'}`} />
-            {backendOnline ? 'FastAPI Online' : 'Reconnecting'}
+            {backendOnline ? 'FastAPI v3.0 Online' : 'Reconnecting'}
           </span>
         </div>
 
@@ -58,7 +58,7 @@ export const TopBar: React.FC<TopBarProps> = ({
             }`}
           >
             <LayoutDashboard className="w-4 h-4" />
-            Sam's Dashboard
+            Sam&apos;s Dashboard
           </button>
           <button
             onClick={() => setActiveTab('downloads')}
@@ -76,7 +76,7 @@ export const TopBar: React.FC<TopBarProps> = ({
             }`}
           >
             <Terminal className="w-4 h-4" />
-            3-Round Tests
+            14-Point Verification
           </button>
         </nav>
 
@@ -86,10 +86,10 @@ export const TopBar: React.FC<TopBarProps> = ({
           <button
             onClick={() => setActiveTab('downloads')}
             className="px-3 py-1.5 text-xs font-bold text-[#080B11] bg-cyan-400 hover:bg-cyan-300 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-md shadow-cyan-500/20"
-            title="Direct Installable APK Downloads (v2.5.0 Release)"
+            title="Direct Installable APK Downloads (v3.0 Release)"
           >
             <Download className="w-4 h-4" />
-            <span className="hidden sm:inline">Download APKs</span>
+            <span className="hidden sm:inline">Download v3.0 APKs</span>
             <span className="sm:hidden">APKs</span>
           </button>
         </div>
@@ -120,6 +120,12 @@ export const TopBar: React.FC<TopBarProps> = ({
           className={activeTab === 'downloads' ? 'text-cyan-400 font-bold' : ''}
         >
           APKs
+        </button>
+        <button
+          onClick={() => setActiveTab('testing')}
+          className={activeTab === 'testing' ? 'text-cyan-400 font-bold' : ''}
+        >
+          QA
         </button>
       </div>
     </header>

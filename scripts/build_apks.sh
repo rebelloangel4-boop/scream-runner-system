@@ -140,21 +140,25 @@ zip -q -d "$DASH_UNSIGNED" "META-INF/*" 2>/dev/null || true
 
 rm -f /tmp/scream-runner-aligned.apk /tmp/sams-dashboard-aligned.apk "$ROOT_DIR/public/downloads/"*.idsig
 
+cp -f "$ROOT_DIR/public/downloads/scream-runner.apk" "$ROOT_DIR/public/downloads/scream-runner-v3.0.apk"
+cp -f "$ROOT_DIR/public/downloads/sams-dashboard.apk" "$ROOT_DIR/public/downloads/sams-dashboard-v3.0.apk"
+
 # 5. Verify Zipalign, APK Signatures (v1 + v2 + v3 with zero warnings), and Badging
 echo "--- Verifying 4-Byte Zipalign ---"
-"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/scream-runner.apk" && echo "scream-runner.apk zipalign: OK"
-"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/sams-dashboard.apk" && echo "sams-dashboard.apk zipalign: OK"
+"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/scream-runner-v3.0.apk" && echo "scream-runner-v3.0.apk zipalign: OK"
+"$ZIPALIGN" -c 4 "$ROOT_DIR/public/downloads/sams-dashboard-v3.0.apk" && echo "sams-dashboard-v3.0.apk zipalign: OK"
 
 echo "--- Verifying APK Signatures (v1 + v2 + v3) ---"
-"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/scream-runner.apk"
-"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/sams-dashboard.apk"
+"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/scream-runner-v3.0.apk"
+"$APKSIGNER" verify -v "$ROOT_DIR/public/downloads/sams-dashboard-v3.0.apk"
 
-echo "--- Inspecting Scream Runner Release Badging ---"
-"$AAPT" dump badging "$ROOT_DIR/public/downloads/scream-runner.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
+echo "--- Inspecting Scream Runner v3.0 Release Badging ---"
+"$AAPT" dump badging "$ROOT_DIR/public/downloads/scream-runner-v3.0.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
 
-echo "--- Inspecting Sam's Dashboard Release Badging ---"
-"$AAPT" dump badging "$ROOT_DIR/public/downloads/sams-dashboard.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
+echo "--- Inspecting Sam's Dashboard v3.0 Release Badging ---"
+"$AAPT" dump badging "$ROOT_DIR/public/downloads/sams-dashboard-v3.0.apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|uses-permission:|application-label:|launchable-activity:"
 
-echo "=== GRADLE RELEASE BUILD COMPLETE ==="
+echo "=== GRADLE RELEASE BUILD v3.0 COMPLETE ==="
 ls -lh "$ROOT_DIR/public/downloads/"*.apk
 sha256sum "$ROOT_DIR/public/downloads/"*.apk
+

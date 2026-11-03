@@ -20,10 +20,16 @@ function startPythonBackend() {
   const backendScript = path.resolve(__dirname, 'backend', 'main.py');
   const reqFile = path.resolve(__dirname, 'backend', 'requirements.txt');
 
-  const checkFastApi = spawnSync('python3', ['-c', 'import fastapi, uvicorn, multipart, jwt'], { stdio: 'ignore' });
+  const checkFastApi = spawnSync('python3', ['-c', 'import fastapi, uvicorn, multipart, jwt, argon2'], { stdio: 'ignore' });
   if (checkFastApi.status !== 0 && fs.existsSync(reqFile)) {
     console.log('[Backend Bridge] Installing FastAPI Python dependencies...');
-    spawnSync('pip3', ['install', '--break-system-packages', '-q', '-r', reqFile], { stdio: 'inherit' });
+    const checkPip = spawnSync('python3', ['-m', 'pip', '--version'], { stdio: 'ignore' });
+    if (checkPip.status !== 0) {
+      spawnSync('bash', ['-c', 'curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --break-system-packages -q'], {
+        stdio: 'inherit',
+      });
+    }
+    spawnSync('python3', ['-m', 'pip', 'install', '--break-system-packages', '-q', '-r', reqFile], { stdio: 'inherit' });
   }
 
   console.log(`[Backend Bridge] Starting FastAPI backend on port ${PYTHON_PORT}...`);

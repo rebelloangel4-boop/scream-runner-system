@@ -4,77 +4,156 @@ import time
 import uuid
 import json
 import math
+import hmac
+import base64
 import struct
+import shutil
+import secrets
 import sqlite3
 import hashlib
-import asyncio
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Header, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse, Response, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import jwt
+
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, InvalidHashError
+    ARGON2_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
+    HAS_ARGON2 = True
+except Exception:
+    ARGON2_HASHER = None
+    HAS_ARGON2 = False
 
 # Environment and Path setup
 BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
+STORAGE_DIR = Path(os.environ.get("SCREAM_STORAGE_DIR", str(BASE_DIR / "storage"))).resolve()
 AUDIO_STORAGE_DIR = STORAGE_DIR / "audio"
+BACKUP_STORAGE_DIR = STORAGE_DIR / "backups"
 DB_PATH = STORAGE_DIR / "scream_runner.db"
+JWT_SECRET_FILE = STORAGE_DIR / ".jwt_secret"
+LEGACY_SECRET_FILE = STORAGE_DIR / ".admin_secret"
 
 AUDIO_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Security Secrets
-SECRET_FILE = STORAGE_DIR / ".admin_secret"
-DEFAULT_ADMIN_PASS = "screamrunner2026!"
-
-def load_or_generate_secret() -> str:
-    if "ADMIN_PASSWORD" in os.environ and os.environ["ADMIN_PASSWORD"]:
-        return os.environ["ADMIN_PASSWORD"]
-    if SECRET_FILE.exists():
-        try:
-            val = SECRET_FILE.read_text().strip()
-            if val:
-                return val
-        except Exception:
-            pass
+# Remove legacy plaintext secret file if present
+if LEGACY_SECRET_FILE.exists():
     try:
-        SECRET_FILE.write_text(DEFAULT_ADMIN_PASS)
-        os.chmod(SECRET_FILE, 0o600)
+        LEGACY_SECRET_FILE.unlink()
     except Exception:
         pass
-    return DEFAULT_ADMIN_PASS
 
-JWT_SECRET = os.environ.get("JWT_SECRET") or "sr_jwt_production_secret_key_2026_verified"
+
+def load_or_create_jwt_secret() -> str:
+    env_secret = os.environ.get("JWT_SECRET", "").strip()
+    if len(env_secret) >= 32:
+        return env_secret
+    if JWT_SECRET_FILE.exists():
+        try:
+            saved = JWT_SECRET_FILE.read_text().strip()
+            if len(saved) >= 32:
+                return saved
+        except Exception:
+            pass
+    generated = secrets.token_hex(32)
+    try:
+        JWT_SECRET_FILE.write_text(generated)
+        os.chmod(JWT_SECRET_FILE, 0o600)
+    except Exception:
+        pass
+    return generated
+
+
+JWT_SECRET = load_or_create_jwt_secret()
 JWT_ALGORITHM = "HS256"
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = load_or_generate_secret()
+ACCESS_TOKEN_TTL_SEC = 3600       # 1 hour short-lived access token
+REFRESH_TOKEN_TTL_SEC = 604800    # 7 days refresh token
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB upload limit
 
-# Failed login attempt tracking (Rate Limiting)
+# Rate limiting buckets
 failed_login_attempts: Dict[str, List[float]] = {}
 RATE_LIMIT_WINDOW_SEC = 60
 MAX_FAILED_ATTEMPTS = 5
 
-# Global event sequence counter
+# Global monotonic event sequence counter
 event_seq_counter = 0
 
+
+def hash_password(password: str) -> str:
+    """Hashes a password using Argon2id (or PBKDF2-HMAC-SHA256 600k fallback)."""
+    if HAS_ARGON2 and ARGON2_HASHER is not None:
+        return ARGON2_HASHER.hash(password)
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600000, dklen=32)
+    return f"pbkdf2_sha256$600000${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verifies a password against an Argon2id or PBKDF2-HMAC-SHA256 hash in constant time."""
+    if not stored_hash or not password:
+        return False
+    if stored_hash.startswith("$argon2"):
+        if not HAS_ARGON2 or ARGON2_HASHER is None:
+            return False
+        try:
+            return ARGON2_HASHER.verify(stored_hash, password)
+        except (VerifyMismatchError, InvalidHashError, Exception):
+            return False
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            parts = stored_hash.split("$")
+            iterations = int(parts[1])
+            salt = bytes.fromhex(parts[2])
+            expected_dk = bytes.fromhex(parts[3])
+            computed_dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=len(expected_dk))
+            return hmac.compare_digest(computed_dk, expected_dk)
+        except Exception:
+            return False
+    return False
+
+
 def get_db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-# Database Initialization with WAL Mode
+
 def init_db():
+    global event_seq_counter
     conn = get_db_conn()
     with conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            recovery_key_hash TEXT NOT NULL,
+            hash_algorithm TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS devices (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             device_token TEXT NOT NULL UNIQUE,
+            os_version TEXT DEFAULT 'Android',
+            app_version TEXT DEFAULT '3.0.0',
             registered_at REAL NOT NULL,
             last_ping REAL NOT NULL,
             status TEXT NOT NULL DEFAULT 'online'
@@ -130,103 +209,51 @@ def init_db():
         );
         """)
 
-    # Seed initial verified demo session if database has no sessions yet
-    count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-    conn.close()
-    if count == 0:
-        seed_demo_data()
+        # Apply v3 migration columns safely if upgrading from v2.x database
+        existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()]
+        if "os_version" not in existing_cols:
+            conn.execute("ALTER TABLE devices ADD COLUMN os_version TEXT DEFAULT 'Android'")
+        if "app_version" not in existing_cols:
+            conn.execute("ALTER TABLE devices ADD COLUMN app_version TEXT DEFAULT '3.0.0'")
 
-def seed_demo_data() -> dict:
-    conn = get_db_conn()
-    now = time.time()
-    dev_id = "dev_cyber_pixel_7"
-    conn.execute("""
-        INSERT OR IGNORE INTO devices (id, name, device_token, registered_at, last_ping, status)
-        VALUES (?, 'Pixel 7 Pro (Android 13)', 'dev_tok_demo_pixel_7', ?, ?, 'recording')
-    """, (dev_id, now - 7200, now))
-    conn.execute("UPDATE devices SET last_ping = ?, status = 'recording' WHERE id = ?", (now, dev_id))
-
-    session_id = "sess_demo_run_01"
-    conn.execute("""
-        INSERT OR REPLACE INTO sessions (id, device_id, started_at, ended_at, duration_seconds, consent_confirmed, total_speech_segments, status)
-        VALUES (?, ?, ?, ?, 3600, 1, 4, 'active')
-    """, (session_id, dev_id, now - 3600, None))
-
-    session_dir = AUDIO_STORAGE_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    bursts = [
-        {"idx": 1, "start_offset": 120, "dur": 3200, "peak": -8.4, "avg": -18.2, "freq": 440, "desc": "Loud shout 'JUMP NOW'"},
-        {"idx": 2, "start_offset": 450, "dur": 2400, "peak": -14.1, "avg": -22.5, "freq": 330, "desc": "Conversational speech segment"},
-        {"idx": 3, "start_offset": 890, "dur": 4100, "peak": -5.2, "avg": -15.8, "freq": 520, "desc": "High-volume peak moment (> -10dB)"},
-        {"idx": 4, "start_offset": 1420, "dur": 1800, "peak": -19.3, "avg": -27.0, "freq": 280, "desc": "Whisper / soft audio command"}
-    ]
-
-    for b in bursts:
-        seg_id = f"seg_demo_{b['idx']}"
-        file_path = session_dir / f"{seg_id}.wav"
-
-        sample_rate = 16000
-        total_samples = int(sample_rate * (b['dur'] / 1000.0))
-        pcm_data = bytearray()
-
-        waveform_bars = []
-        bars_count = 60
-        for bar_i in range(bars_count):
-            bar_env = math.sin((bar_i / bars_count) * math.pi) * (10 ** (b['peak'] / 20.0))
-            waveform_bars.append(round(min(1.0, max(0.05, bar_env + 0.1 * math.sin(bar_i * 1.5))), 3))
-
-        for s in range(total_samples):
-            t = s / sample_rate
-            env = math.sin((s / total_samples) * math.pi)
-            sample_val = int(32767 * env * (10 ** (b['peak'] / 20.0)) * math.sin(2 * math.pi * b['freq'] * t))
-            sample_val = max(-32768, min(32767, sample_val))
-            pcm_data.extend(sample_val.to_bytes(2, byteorder='little', signed=True))
-
-        header = struct.pack(
-            '<4sI4s4sIHHIIHH4sI',
-            b'RIFF',
-            36 + len(pcm_data),
-            b'WAVE',
-            b'fmt ',
-            16,
-            1,
-            1,
-            sample_rate,
-            sample_rate * 2,
-            2,
-            16,
-            b'data',
-            len(pcm_data)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, description, applied_at) VALUES (3, 'v3.0 Argon2id admin_users, device tokens, migrations & backups', ?)",
+            (time.time(),)
         )
-        full_wav = header + pcm_data
-        with open(file_path, "wb") as f:
-            f.write(full_wav)
 
-        file_size = len(full_wav)
-        f_hash = hashlib.sha256(full_wav).hexdigest()
+        # Purge any legacy synthetic/demo data
+        conn.execute("DELETE FROM audio_segments WHERE session_id = 'sess_demo_run_01'")
+        conn.execute("DELETE FROM sessions WHERE id = 'sess_demo_run_01'")
+        conn.execute("DELETE FROM devices WHERE id = 'dev_cyber_pixel_7'")
 
-        conn.execute("""
-            INSERT OR REPLACE INTO audio_segments (
-                id, session_id, seq_index, start_time, end_time, duration_ms,
-                peak_db, avg_db, speech_confidence, file_path, file_hash, file_size_bytes,
-                created_at, waveform_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            seg_id, session_id, b['idx'], now - (3600 - b['start_offset']),
-            now - (3600 - b['start_offset']) + (b['dur'] / 1000.0),
-            b['dur'], b['peak'], b['avg'], 0.94, str(file_path), f_hash, file_size,
-            now - (3600 - b['start_offset']), json.dumps(waveform_bars)
-        ))
+        max_seq_row = conn.execute("SELECT COALESCE(MAX(event_seq), 0) FROM events").fetchone()
+        event_seq_counter = int(max_seq_row[0]) if max_seq_row else 0
 
-    conn.commit()
+        # Optional environment-driven bootstrap if deployment owner explicitly provides ADMIN_INITIAL_PASSWORD
+        env_init_pass = os.environ.get("ADMIN_INITIAL_PASSWORD", "").strip()
+        if env_init_pass and len(env_init_pass) >= 8:
+            existing_admin = conn.execute("SELECT username FROM admin_users LIMIT 1").fetchone()
+            if not existing_admin:
+                env_user = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
+                env_recovery = os.environ.get("ADMIN_RECOVERY_KEY", "").strip() or f"SR3-{secrets.token_hex(8).upper()}"
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO admin_users (username, password_hash, recovery_key_hash, hash_algorithm, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        env_user,
+                        hash_password(env_init_pass),
+                        hash_password(env_recovery),
+                        "argon2id" if HAS_ARGON2 else "pbkdf2_sha256",
+                        now,
+                        now,
+                    )
+                )
     conn.close()
-    return {"status": "seeded", "session_id": session_id, "segments": 4}
+
 
 init_db()
 
-# FastAPI App
-app = FastAPI(title="Scream Runner & Sam's Dashboard Backend", version="2.1.0")
+app = FastAPI(title="Scream Runner & Sam's Dashboard Backend", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -236,7 +263,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active WebSocket connections
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -259,7 +286,9 @@ class ConnectionManager:
         for dc in dead_connections:
             self.disconnect(dc)
 
+
 manager = ConnectionManager()
+
 
 def record_event(conn: sqlite3.Connection, event_type: str, session_id: Optional[str] = None, details: Optional[dict] = None) -> int:
     global event_seq_counter
@@ -274,56 +303,137 @@ def record_event(conn: sqlite3.Connection, event_type: str, session_id: Optional
     conn.commit()
     return event_seq_counter
 
-# JWT Authentication
-def create_jwt_token(subject: str, role: str = "admin", expires_in_seconds: int = 86400) -> str:
+
+# ----------------- JWT Token Creation & Validation -----------------
+def create_jwt_token(subject: str, role: str = "admin", token_type: str = "access", expires_in_seconds: int = ACCESS_TOKEN_TTL_SEC) -> str:
     jti = str(uuid.uuid4())
     now = int(time.time())
     payload = {
         "sub": subject,
         "role": role,
+        "type": token_type,
         "jti": jti,
         "iat": now,
         "exp": now + expires_in_seconds
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def verify_token(authorization: Optional[str] = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
-    token = authorization[7:].strip()
+
+def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expected_role: str = "admin") -> dict:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        jti = payload.get("jti")
-        conn = get_db_conn()
-        revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
-        conn.close()
-        if revoked:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
-        return payload
+        payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
 
-def verify_optional_token(authorization: Optional[str] = Header(None)) -> Optional[dict]:
-    """If an Authorization Bearer header is provided, strictly validates it (rejecting revoked/invalid tokens)."""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:].strip()
-        if token and token != "null" and token != "undefined":
-            return verify_token(authorization)
-    return None
+    if payload.get("type") != expected_type:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token type: expected '{expected_type}'"
+        )
+    if expected_role and payload.get("role") != expected_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient role permissions"
+        )
 
-# Models
+    jti = payload.get("jti")
+    conn = get_db_conn()
+    revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
+    conn.close()
+    if revoked:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
+    return payload
+
+
+def verify_admin_token(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None)
+) -> dict:
+    raw = None
+    if authorization and authorization.startswith("Bearer "):
+        raw = authorization[7:].strip()
+    elif token:
+        raw = token.strip()
+    if not raw or raw in ("null", "undefined"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid administrator Authorization token")
+    return decode_and_validate_jwt(raw, expected_type="access", expected_role="admin")
+
+
+def verify_device_or_admin(
+    x_device_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None)
+) -> dict:
+    """Validates either an enrolled device token (X-Device-Token) or an administrator Bearer token."""
+    if x_device_token and x_device_token.strip():
+        tok = x_device_token.strip()
+        conn = get_db_conn()
+        dev = conn.execute("SELECT id, name FROM devices WHERE device_token = ?", (tok,)).fetchone()
+        conn.close()
+        if dev:
+            return {"actor": "device", "device_id": dev["id"], "device_name": dev["name"]}
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or unrecognized X-Device-Token")
+
+    if authorization and authorization.startswith("Bearer "):
+        raw = authorization[7:].strip()
+        if raw.startswith("dev_tok_"):
+            conn = get_db_conn()
+            dev = conn.execute("SELECT id, name FROM devices WHERE device_token = ?", (raw,)).fetchone()
+            conn.close()
+            if dev:
+                return {"actor": "device", "device_id": dev["id"], "device_name": dev["name"]}
+        payload = decode_and_validate_jwt(raw, expected_type="access", expected_role="admin")
+        return {"actor": "admin", "username": payload.get("sub")}
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Device authentication required (provide X-Device-Token from /api/v1/devices/register)"
+    )
+
+
+def check_rate_limit(client_ip: str):
+    now = time.time()
+    attempts = [t for t in failed_login_attempts.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW_SEC]
+    failed_login_attempts[client_ip] = attempts
+    if len(attempts) >= MAX_FAILED_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed authentication attempts. Please wait 60 seconds before retrying."
+        )
+
+
+def record_failed_attempt(client_ip: str):
+    failed_login_attempts.setdefault(client_ip, []).append(time.time())
+
+
+# ----------------- Pydantic Models -----------------
+class AdminSetupRequest(BaseModel):
+    username: str = Field(default="admin", min_length=3, max_length=64)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
 
+
+class PasswordResetRequest(BaseModel):
+    username: str = "admin"
+    recovery_key: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
+
 
 class DeviceRegisterRequest(BaseModel):
     id: Optional[str] = None
     name: str
+    os_version: Optional[str] = "Android 14"
+    app_version: Optional[str] = "3.0.0"
+
 
 class SessionCreateRequest(BaseModel):
     session_id: Optional[str] = None
@@ -331,116 +441,291 @@ class SessionCreateRequest(BaseModel):
     device_name: Optional[str] = None
     consent_confirmed: bool = True
 
+
 class SessionStopRequest(BaseModel):
     session_id: str
 
-# ----------------- Auth Endpoints -----------------
+
+class SessionInterruptionRequest(BaseModel):
+    session_id: str
+    event_type: str = "INTERRUPTION"
+    reason: str = "Microphone or network interruption"
+    duration_ms: int = 0
+
+
+class StorageRestoreRequest(BaseModel):
+    devices: Optional[List[Dict[str, Any]]] = None
+    sessions: Optional[List[Dict[str, Any]]] = None
+    audio_segments: Optional[List[Dict[str, Any]]] = None
+
+
+# ----------------- Administrator Setup, Login & Reset Endpoints -----------------
+@app.get("/api/v1/auth/status")
+def auth_setup_status():
+    conn = get_db_conn()
+    row = conn.execute("SELECT username, hash_algorithm, created_at, updated_at FROM admin_users LIMIT 1").fetchone()
+    conn.close()
+    if row:
+        return {
+            "setup_required": False,
+            "admin_username": row["username"],
+            "hash_algorithm": row["hash_algorithm"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "access_token_ttl_seconds": ACCESS_TOKEN_TTL_SEC,
+            "refresh_token_ttl_seconds": REFRESH_TOKEN_TTL_SEC,
+        }
+    return {
+        "setup_required": True,
+        "admin_username": None,
+        "hash_algorithm": "argon2id" if HAS_ARGON2 else "pbkdf2_sha256",
+        "message": "First-time administrator setup required. Call POST /api/v1/auth/setup to configure your administrator password."
+    }
+
+
+@app.post("/api/v1/auth/setup")
+def setup_first_admin(req: AdminSetupRequest, request: Request):
+    username = req.username.strip()
+    password = req.password
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Administrator username must be at least 3 characters")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Administrator password must be at least 8 characters")
+
+    conn = get_db_conn()
+    existing = conn.execute("SELECT username FROM admin_users LIMIT 1").fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Administrator account is already configured. Sign in with your password or use your deployment Recovery Key at POST /api/v1/auth/reset-password."
+        )
+
+    recovery_key = f"SR3-{secrets.token_hex(4).upper()}-{secrets.token_hex(4).upper()}-{secrets.token_hex(4).upper()}"
+    now = time.time()
+    pw_hash = hash_password(password)
+    rec_hash = hash_password(recovery_key)
+    algo = "argon2id" if HAS_ARGON2 else "pbkdf2_sha256"
+
+    with conn:
+        conn.execute(
+            "INSERT INTO admin_users (username, password_hash, recovery_key_hash, hash_algorithm, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, pw_hash, rec_hash, algo, now, now)
+        )
+        record_event(conn, "ADMIN_SETUP_COMPLETED", None, {"username": username, "hash_algorithm": algo})
+    conn.close()
+
+    access_token = create_jwt_token(username, role="admin", token_type="access", expires_in_seconds=ACCESS_TOKEN_TTL_SEC)
+    refresh_token = create_jwt_token(username, role="admin", token_type="refresh", expires_in_seconds=REFRESH_TOKEN_TTL_SEC)
+
+    return {
+        "status": "setup_completed",
+        "username": username,
+        "hash_algorithm": algo,
+        "recovery_key": recovery_key,
+        "recovery_notice": "Save this Recovery Key in a secure password manager. It is shown only once and is required to reset your password.",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_TTL_SEC,
+        "user": {"username": username, "role": "admin"}
+    }
+
+
 @app.post("/api/v1/auth/login")
 def login(req: LoginRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
+    check_rate_limit(client_ip)
 
-    valid_passwords = {ADMIN_PASSWORD, DEFAULT_ADMIN_PASS}
-    if SECRET_FILE.exists():
-        try:
-            valid_passwords.add(SECRET_FILE.read_text().strip())
-        except Exception:
-            pass
+    conn = get_db_conn()
+    admin_row = conn.execute("SELECT username, password_hash FROM admin_users WHERE username = ?", (req.username.strip(),)).fetchone()
+    any_admin = conn.execute("SELECT username FROM admin_users LIMIT 1").fetchone()
+    conn.close()
 
-    # Check if valid credentials first (clears rate limit bucket for legitimate admin)
-    if req.username == ADMIN_USERNAME and req.password in valid_passwords:
+    if not any_admin:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="First-time administrator setup is required before signing in. Please create your administrator account first."
+        )
+
+    if admin_row and verify_password(req.password, admin_row["password_hash"]):
         failed_login_attempts.pop(client_ip, None)
-        access_token = create_jwt_token(req.username, role="admin", expires_in_seconds=86400)
-        refresh_token = create_jwt_token(req.username, role="refresh", expires_in_seconds=604800)
+        access_token = create_jwt_token(admin_row["username"], role="admin", token_type="access", expires_in_seconds=ACCESS_TOKEN_TTL_SEC)
+        refresh_token = create_jwt_token(admin_row["username"], role="admin", token_type="refresh", expires_in_seconds=REFRESH_TOKEN_TTL_SEC)
+        conn2 = get_db_conn()
+        record_event(conn2, "ADMIN_LOGIN_SUCCESS", None, {"username": admin_row["username"], "ip": client_ip})
+        conn2.close()
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
-            "expires_in": 86400,
-            "user": {"username": req.username, "role": "admin"}
+            "expires_in": ACCESS_TOKEN_TTL_SEC,
+            "user": {"username": admin_row["username"], "role": "admin"}
         }
 
-    # Check rate limit for failed attempts
-    attempts = [t for t in failed_login_attempts.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW_SEC]
-    failed_login_attempts[client_ip] = attempts
-    if len(attempts) >= MAX_FAILED_ATTEMPTS:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed login attempts. Please wait 60 seconds before retrying."
-        )
+    record_failed_attempt(client_ip)
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid administrator username or password")
 
-    # Record failed attempt
-    failed_login_attempts.setdefault(client_ip, []).append(now)
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid administrator credentials")
+
+@app.post("/api/v1/auth/reset-password")
+def reset_admin_password(req: PasswordResetRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(client_ip)
+
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+
+    conn = get_db_conn()
+    admin_row = conn.execute(
+        "SELECT username, recovery_key_hash FROM admin_users WHERE username = ?",
+        (req.username.strip(),)
+    ).fetchone()
+
+    if not admin_row:
+        conn.close()
+        record_failed_attempt(client_ip)
+        raise HTTPException(status_code=404, detail="Administrator account not found")
+
+    env_master_recovery = os.environ.get("ADMIN_RECOVERY_KEY", "").strip()
+    valid_recovery = verify_password(req.recovery_key.strip(), admin_row["recovery_key_hash"]) or (
+        bool(env_master_recovery) and hmac.compare_digest(req.recovery_key.strip(), env_master_recovery)
+    )
+
+    if not valid_recovery:
+        conn.close()
+        record_failed_attempt(client_ip)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid deployment Recovery Key")
+
+    failed_login_attempts.pop(client_ip, None)
+    new_pw_hash = hash_password(req.new_password)
+    algo = "argon2id" if HAS_ARGON2 else "pbkdf2_sha256"
+    now = time.time()
+
+    with conn:
+        conn.execute(
+            "UPDATE admin_users SET password_hash = ?, hash_algorithm = ?, updated_at = ? WHERE username = ?",
+            (new_pw_hash, algo, now, admin_row["username"])
+        )
+        record_event(conn, "ADMIN_PASSWORD_RESET", None, {"username": admin_row["username"], "ip": client_ip})
+    conn.close()
+
+    access_token = create_jwt_token(admin_row["username"], role="admin", token_type="access", expires_in_seconds=ACCESS_TOKEN_TTL_SEC)
+    refresh_token = create_jwt_token(admin_row["username"], role="admin", token_type="refresh", expires_in_seconds=REFRESH_TOKEN_TTL_SEC)
+    return {
+        "status": "password_reset",
+        "username": admin_row["username"],
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_TTL_SEC
+    }
+
 
 @app.post("/api/v1/auth/refresh")
 def refresh_token_endpoint(req: RefreshRequest):
-    payload = verify_token(f"Bearer {req.refresh_token}")
-    username = payload.get("sub", ADMIN_USERNAME)
-    new_access_token = create_jwt_token(username, role="admin", expires_in_seconds=86400)
+    payload = decode_and_validate_jwt(req.refresh_token.strip(), expected_type="refresh", expected_role="admin")
+    username = payload.get("sub", "admin")
+    old_jti = payload.get("jti")
+    if old_jti:
+        conn = get_db_conn()
+        conn.execute("INSERT OR IGNORE INTO revoked_tokens (jti, revoked_at) VALUES (?, ?)", (old_jti, time.time()))
+        conn.commit()
+        conn.close()
+
+    new_access_token = create_jwt_token(username, role="admin", token_type="access", expires_in_seconds=ACCESS_TOKEN_TTL_SEC)
+    new_refresh_token = create_jwt_token(username, role="admin", token_type="refresh", expires_in_seconds=REFRESH_TOKEN_TTL_SEC)
     return {
         "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
         "token_type": "bearer",
-        "expires_in": 86400
+        "expires_in": ACCESS_TOKEN_TTL_SEC
     }
 
+
 @app.get("/api/v1/auth/me")
-def get_current_user(payload: dict = Depends(verify_token)):
+def get_current_user(payload: dict = Depends(verify_admin_token)):
     return {
         "authenticated": True,
         "username": payload.get("sub"),
         "role": payload.get("role"),
+        "token_type": payload.get("type"),
         "jti": payload.get("jti")
     }
 
+
 @app.get("/api/v1/auth/credentials-info")
 def credentials_info():
-    is_custom_env = "ADMIN_PASSWORD" in os.environ and bool(os.environ["ADMIN_PASSWORD"])
+    conn = get_db_conn()
+    row = conn.execute("SELECT username, hash_algorithm, created_at FROM admin_users LIMIT 1").fetchone()
+    conn.close()
     return {
-        "admin_username": ADMIN_USERNAME,
-        "configured_via_env": is_custom_env,
-        "secret_file_persisted": SECRET_FILE.exists(),
+        "setup_required": row is None,
+        "admin_username": row["username"] if row else None,
+        "hash_algorithm": row["hash_algorithm"] if row else ("argon2id" if HAS_ARGON2 else "pbkdf2_sha256"),
         "auth_required": True,
-        "note": "Credentials set via ADMIN_PASSWORD environment variable or local encrypted secret."
+        "default_passwords_disabled": True,
+        "note": "Default passwords and hardcoded credentials are completely removed in v3.0. First-time setup hashes administrator credentials with Argon2id."
     }
 
+
 @app.post("/api/v1/auth/logout")
-def logout(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        return {"status": "ok", "message": "No token provided"}
-    token = authorization[7:].strip()
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        jti = payload.get("jti")
-        if jti:
-            conn = get_db_conn()
-            conn.execute("INSERT OR IGNORE INTO revoked_tokens (jti, revoked_at) VALUES (?, ?)", (jti, time.time()))
-            conn.commit()
-            conn.close()
-    except Exception:
-        pass
-    return {"status": "ok", "message": "Logged out successfully and token revoked"}
+def logout(authorization: Optional[str] = Header(None), req_body: Optional[Dict[str, str]] = None):
+    revoked_count = 0
+    tokens_to_revoke = []
+    if authorization and authorization.startswith("Bearer "):
+        tokens_to_revoke.append(authorization[7:].strip())
+    if req_body and isinstance(req_body, dict) and req_body.get("refresh_token"):
+        tokens_to_revoke.append(req_body["refresh_token"].strip())
+
+    conn = get_db_conn()
+    for tok in tokens_to_revoke:
+        try:
+            payload = jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+            jti = payload.get("jti")
+            if jti:
+                conn.execute("INSERT OR IGNORE INTO revoked_tokens (jti, revoked_at) VALUES (?, ?)", (jti, time.time()))
+                revoked_count += 1
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "revoked_tokens": revoked_count, "message": "Logged out and token(s) revoked"}
+
 
 # ----------------- APK Downloads -----------------
 PUBLIC_DOWNLOADS_DIR = BASE_DIR.parent / "public" / "downloads"
 
+
 @app.get("/api/v1/downloads/info")
 def get_downloads_info():
-    apk_files = ["scream-runner.apk", "sams-dashboard.apk", "scream-runner-v2.4.0.apk", "sams-dashboard-v2.4.0.apk"]
+    apk_files = [
+        "scream-runner-v3.0.apk",
+        "sams-dashboard-v3.0.apk",
+        "scream-runner.apk",
+        "sams-dashboard.apk",
+    ]
     info = []
+    seen = set()
     for fname in apk_files:
         fpath = PUBLIC_DOWNLOADS_DIR / fname
-        if fpath.exists():
+        if not fpath.exists():
+            if fname.startswith("scream-runner"):
+                fpath = PUBLIC_DOWNLOADS_DIR / "scream-runner.apk"
+            elif fname.startswith("sams-dashboard"):
+                fpath = PUBLIC_DOWNLOADS_DIR / "sams-dashboard.apk"
+        if fpath.exists() and fname not in seen:
+            seen.add(fname)
             data = fpath.read_bytes()
             info.append({
                 "filename": fname,
                 "size_bytes": len(data),
-                "size_mb": round(len(data) / (1024 * 1024), 2),
+                "size_kb": round(len(data) / 1024, 1),
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "download_url": f"/downloads/{fname}",
                 "api_download_url": f"/api/v1/downloads/{fname}"
             })
     return {"downloads": info}
+
 
 @app.get("/api/v1/downloads/{filename}")
 def download_apk(filename: str):
@@ -471,51 +756,66 @@ def download_apk(filename: str):
         }
     )
 
-# ----------------- Device Management -----------------
+
+# ----------------- Authenticated Device Enrollment & Management -----------------
 @app.post("/api/v1/devices/register")
 async def register_device(req: DeviceRegisterRequest):
+    name = req.name.strip()
+    if not name or len(name) > 120:
+        raise HTTPException(status_code=400, detail="Valid device name is required")
+
     conn = get_db_conn()
     now = time.time()
-    # Reuse existing device if same id or name exists
     existing = None
     if req.id:
-        existing = conn.execute("SELECT id, device_token FROM devices WHERE id = ?", (req.id,)).fetchone()
+        existing = conn.execute("SELECT id, device_token FROM devices WHERE id = ?", (req.id.strip(),)).fetchone()
     if not existing:
-        existing = conn.execute("SELECT id, device_token FROM devices WHERE name = ?", (req.name,)).fetchone()
+        existing = conn.execute("SELECT id, device_token FROM devices WHERE name = ?", (name,)).fetchone()
 
     if existing:
         device_id = existing["id"]
         token = existing["device_token"]
-        conn.execute("UPDATE devices SET last_ping = ?, status = 'online', name = ? WHERE id = ?", (now, req.name, device_id))
-    else:
-        device_id = req.id or f"dev_{uuid.uuid4().hex[:10]}"
-        token = f"dev_tok_{hashlib.sha256(f'{device_id}{now}'.encode()).hexdigest()[:32]}"
         conn.execute(
-            "INSERT INTO devices (id, name, device_token, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, ?)",
-            (device_id, req.name, token, now, now, "online")
+            "UPDATE devices SET last_ping = ?, status = 'online', name = ?, os_version = ?, app_version = ? WHERE id = ?",
+            (now, name, req.os_version or "Android", req.app_version or "3.0.0", device_id)
         )
+    else:
+        device_id = (req.id.strip() if req.id else None) or f"dev_{uuid.uuid4().hex[:10]}"
+        token = f"dev_tok_{secrets.token_hex(24)}"
+        conn.execute(
+            "INSERT INTO devices (id, name, device_token, os_version, app_version, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (device_id, name, token, req.os_version or "Android", req.app_version or "3.0.0", now, now, "online")
+        )
+    seq = record_event(conn, "DEVICE_REGISTERED", None, {"device_id": device_id, "name": name})
     conn.commit()
     conn.close()
 
     await manager.broadcast({
         "type": "DEVICE_REGISTERED",
+        "seq": seq,
         "device_id": device_id,
-        "name": req.name,
+        "name": name,
         "status": "online",
         "last_ping": now
     })
     return {"device_id": device_id, "device_token": token, "status": "registered"}
 
+
 @app.post("/api/v1/devices/{device_id}/ping")
-async def ping_device(device_id: str, status_val: str = "online", name: Optional[str] = None):
+async def ping_device(
+    device_id: str,
+    status_val: str = "online",
+    name: Optional[str] = None,
+    actor: dict = Depends(verify_device_or_admin)
+):
     conn = get_db_conn()
     now = time.time()
     existing = conn.execute("SELECT id FROM devices WHERE id = ?", (device_id,)).fetchone()
     if existing:
         conn.execute("UPDATE devices SET last_ping = ?, status = ? WHERE id = ?", (now, status_val, device_id))
     else:
-        dev_name = name or f"Android Device ({device_id[:8]})"
-        token = f"dev_tok_{hashlib.sha256(f'{device_id}{now}'.encode()).hexdigest()[:32]}"
+        dev_name = name or actor.get("device_name") or f"Android Device ({device_id[:8]})"
+        token = f"dev_tok_{secrets.token_hex(24)}"
         conn.execute(
             "INSERT INTO devices (id, name, device_token, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, ?)",
             (device_id, dev_name, token, now, now, status_val)
@@ -531,25 +831,31 @@ async def ping_device(device_id: str, status_val: str = "online", name: Optional
     })
     return {"status": "ok", "device_id": device_id, "last_ping": now}
 
+
 @app.get("/api/v1/devices")
-def list_devices(auth: Optional[dict] = Depends(verify_optional_token)):
+def list_devices(auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
-    rows = conn.execute("SELECT id, name, registered_at, last_ping, status FROM devices ORDER BY last_ping DESC").fetchall()
+    rows = conn.execute(
+        "SELECT id, name, os_version, app_version, registered_at, last_ping, status FROM devices ORDER BY last_ping DESC"
+    ).fetchall()
     devices = [dict(r) for r in rows]
     conn.close()
     return {"devices": devices}
 
+
 # ----------------- Sessions -----------------
 @app.post("/api/v1/sessions/start")
-async def start_session(req: SessionCreateRequest):
+async def start_session(req: SessionCreateRequest, actor: dict = Depends(verify_device_or_admin)):
+    if not req.consent_confirmed:
+        raise HTTPException(status_code=400, detail="Explicit user microphone consent is required to start a session")
+
     conn = get_db_conn()
     now = time.time()
 
-    # Ensure parent device exists so foreign key constraint never fails
     dev_row = conn.execute("SELECT id, name FROM devices WHERE id = ?", (req.device_id,)).fetchone()
-    dev_name = req.device_name or (dev_row["name"] if dev_row else f"Android Device ({req.device_id[:10]})")
+    dev_name = req.device_name or (dev_row["name"] if dev_row else actor.get("device_name", f"Android Device ({req.device_id[:10]})"))
     if not dev_row:
-        tok = f"dev_tok_{hashlib.sha256(f'{req.device_id}{now}'.encode()).hexdigest()[:32]}"
+        tok = f"dev_tok_{secrets.token_hex(24)}"
         conn.execute(
             "INSERT OR IGNORE INTO devices (id, name, device_token, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, 'recording')",
             (req.device_id, dev_name, tok, now, now)
@@ -560,8 +866,8 @@ async def start_session(req: SessionCreateRequest):
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:10]}"
     conn.execute(
         """INSERT OR REPLACE INTO sessions (id, device_id, started_at, consent_confirmed, status, total_speech_segments)
-           VALUES (?, ?, ?, ?, 'active', COALESCE((SELECT total_speech_segments FROM sessions WHERE id = ?), 0))""",
-        (session_id, req.device_id, now, 1 if req.consent_confirmed else 0, session_id)
+           VALUES (?, ?, ?, 1, 'active', COALESCE((SELECT total_speech_segments FROM sessions WHERE id = ?), 0))""",
+        (session_id, req.device_id, now, session_id)
     )
     seq = record_event(conn, "SESSION_START", session_id, {"device_id": req.device_id, "device_name": dev_name, "started_at": now})
     conn.commit()
@@ -577,8 +883,9 @@ async def start_session(req: SessionCreateRequest):
     })
     return {"session_id": session_id, "device_id": req.device_id, "status": "active", "started_at": now}
 
+
 @app.post("/api/v1/sessions/stop")
-async def stop_session(req: SessionStopRequest):
+async def stop_session(req: SessionStopRequest, actor: dict = Depends(verify_device_or_admin)):
     conn = get_db_conn()
     now = time.time()
     row = conn.execute("SELECT started_at, device_id FROM sessions WHERE id = ?", (req.session_id,)).fetchone()
@@ -605,8 +912,29 @@ async def stop_session(req: SessionStopRequest):
     })
     return {"session_id": req.session_id, "status": "completed", "duration_seconds": round(duration, 2)}
 
+
+@app.post("/api/v1/sessions/interruption")
+async def log_session_interruption(req: SessionInterruptionRequest, actor: dict = Depends(verify_device_or_admin)):
+    conn = get_db_conn()
+    ev_type = req.event_type if req.event_type in ("INTERRUPTION", "NETWORK_LOSS") else "INTERRUPTION"
+    seq = record_event(conn, ev_type, req.session_id, {
+        "reason": req.reason,
+        "duration_ms": req.duration_ms,
+        "timestamp": time.time()
+    })
+    conn.close()
+    await manager.broadcast({
+        "type": ev_type,
+        "seq": seq,
+        "session_id": req.session_id,
+        "reason": req.reason,
+        "duration_ms": req.duration_ms
+    })
+    return {"status": "logged", "event_seq": seq, "session_id": req.session_id}
+
+
 @app.get("/api/v1/sessions")
-def list_sessions(auth: Optional[dict] = Depends(verify_optional_token)):
+def list_sessions(auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     rows = conn.execute("""
         SELECT s.id, s.device_id, d.name as device_name, s.started_at, s.ended_at,
@@ -627,8 +955,8 @@ def list_sessions(auth: Optional[dict] = Depends(verify_optional_token)):
     conn.close()
     return {"sessions": sessions}
 
+
 def compute_waveform_from_wav_bytes(contents: bytes, num_bars: int = 50) -> str:
-    """Computes normalized 50-bar RMS waveform directly from PCM WAV bytes if not provided by client."""
     pcm = contents[44:] if len(contents) > 44 and contents[:4] == b'RIFF' else contents
     total_samples = len(pcm) // 2
     if total_samples <= 0:
@@ -647,6 +975,7 @@ def compute_waveform_from_wav_bytes(contents: bytes, num_bars: int = 50) -> str:
         bars.append(round(min(1.0, max(0.05, (rms / 32768.0) * 3.0)), 3))
     return json.dumps(bars)
 
+
 # ----------------- Audio Upload & Ingestion -----------------
 @app.post("/api/v1/audio/upload")
 async def upload_audio_segment(
@@ -662,124 +991,124 @@ async def upload_audio_segment(
     file_hash: Optional[str] = Form(None),
     waveform_json: Optional[str] = Form(None),
     device_id: Optional[str] = Form(None),
-    device_name: Optional[str] = Form(None)
+    device_name: Optional[str] = Form(None),
+    actor: dict = Depends(verify_device_or_admin)
 ):
-    try:
-        contents = await audio_file.read()
-        computed_hash = hashlib.sha256(contents).hexdigest()
+    contents = await audio_file.read()
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded audio file exceeds 25 MB limit")
 
-        if file_hash and file_hash != computed_hash:
-            raise HTTPException(status_code=400, detail="SHA-256 integrity verification failed")
+    computed_hash = hashlib.sha256(contents).hexdigest()
+    if file_hash and file_hash.strip().lower() != computed_hash.lower():
+        raise HTTPException(status_code=400, detail="SHA-256 integrity verification failed")
 
-        final_hash = computed_hash
-        conn = get_db_conn()
+    final_hash = computed_hash
+    safe_session_id = "".join(c for c in session_id if c.isalnum() or c in ("_", "-"))[:64]
+    if not safe_session_id:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
 
-        # Idempotency check: duplicate hash within this session
-        existing = conn.execute(
-            "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ?",
-            (session_id, final_hash)
-        ).fetchone()
+    conn = get_db_conn()
+    existing = conn.execute(
+        "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ?",
+        (safe_session_id, final_hash)
+    ).fetchone()
 
-        if existing:
-            conn.close()
-            return {
-                "status": "already_exists",
-                "segment_id": existing["id"],
-                "message": "Segment already ingested with identical SHA-256 hash (idempotent)."
-            }
-
-        segment_id = str(uuid.uuid4())
-        session_audio_dir = AUDIO_STORAGE_DIR / session_id
-        session_audio_dir.mkdir(parents=True, exist_ok=True)
-
-        ext = Path(audio_file.filename).suffix if audio_file.filename else ".wav"
-        if not ext:
-            ext = ".wav"
-        dest_path = session_audio_dir / f"{segment_id}{ext}"
-        with open(dest_path, "wb") as f:
-            f.write(contents)
-
-        now = time.time()
-        resolved_device_id = device_id or "dev_auto_sync"
-        resolved_device_name = device_name or "Scream Runner Android Device"
-
-        # 1. Ensure parent device exists in devices table (satisfies FK on sessions.device_id)
-        dev_exists = conn.execute("SELECT id FROM devices WHERE id = ?", (resolved_device_id,)).fetchone()
-        if not dev_exists:
-            tok = f"dev_tok_{hashlib.sha256(f'{resolved_device_id}{now}'.encode()).hexdigest()[:32]}"
-            conn.execute(
-                "INSERT OR IGNORE INTO devices (id, name, device_token, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, 'recording')",
-                (resolved_device_id, resolved_device_name, tok, now, now)
-            )
-        else:
-            conn.execute("UPDATE devices SET last_ping = ?, status = 'recording' WHERE id = ?", (now, resolved_device_id))
-
-        # 2. Ensure parent session exists in sessions table (satisfies FK on audio_segments.session_id)
-        conn.execute("""
-            INSERT OR IGNORE INTO sessions (id, device_id, started_at, consent_confirmed, status)
-            VALUES (?, ?, ?, 1, 'active')
-        """, (session_id, resolved_device_id, now))
-
-        final_waveform = waveform_json if waveform_json else compute_waveform_from_wav_bytes(contents)
-
-        conn.execute("""
-            INSERT INTO audio_segments (
-                id, session_id, seq_index, start_time, end_time, duration_ms,
-                peak_db, avg_db, speech_confidence, file_path, file_hash, file_size_bytes,
-                created_at, waveform_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            segment_id, session_id, seq_index, start_time, end_time, duration_ms,
-            peak_db, avg_db, speech_confidence, str(dest_path), final_hash, len(contents),
-            now, final_waveform
-        ))
-        conn.execute("UPDATE sessions SET total_speech_segments = total_speech_segments + 1 WHERE id = ?", (session_id,))
-
-        is_highlight = peak_db > -10.0
-        seq = record_event(conn, "AUDIO_UPLOADED", session_id, {
-            "segment_id": segment_id,
-            "peak_db": peak_db,
-            "duration_ms": duration_ms,
-            "is_highlight": is_highlight
-        })
-        conn.commit()
+    if existing:
         conn.close()
-
-        await manager.broadcast({
-            "type": "AUDIO_UPLOADED",
-            "seq": seq,
-            "session_id": session_id,
-            "segment_id": segment_id,
-            "seq_index": seq_index,
-            "peak_db": peak_db,
-            "avg_db": avg_db,
-            "duration_ms": duration_ms,
-            "start_time": start_time,
-            "end_time": end_time,
-            "is_highlight": is_highlight,
-            "waveform_data": final_waveform
-        })
-
         return {
-            "status": "uploaded",
-            "segment_id": segment_id,
-            "session_id": session_id,
+            "status": "already_exists",
+            "segment_id": existing["id"],
+            "session_id": safe_session_id,
             "file_hash": final_hash,
-            "is_highlight": is_highlight
+            "message": "Segment already ingested with identical SHA-256 hash (idempotent)."
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+
+    segment_id = str(uuid.uuid4())
+    session_audio_dir = AUDIO_STORAGE_DIR / safe_session_id
+    session_audio_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_ext = Path(audio_file.filename).suffix.lower() if audio_file.filename else ".wav"
+    ext = raw_ext if raw_ext in (".wav", ".m4a", ".aac") else ".wav"
+    dest_path = session_audio_dir / f"{segment_id}{ext}"
+    with open(dest_path, "wb") as f:
+        f.write(contents)
+
+    now = time.time()
+    resolved_device_id = device_id or actor.get("device_id") or "dev_enrolled"
+    resolved_device_name = device_name or actor.get("device_name") or "Scream Runner Client"
+
+    dev_exists = conn.execute("SELECT id FROM devices WHERE id = ?", (resolved_device_id,)).fetchone()
+    if not dev_exists:
+        tok = f"dev_tok_{secrets.token_hex(24)}"
+        conn.execute(
+            "INSERT OR IGNORE INTO devices (id, name, device_token, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, 'recording')",
+            (resolved_device_id, resolved_device_name, tok, now, now)
+        )
+    else:
+        conn.execute("UPDATE devices SET last_ping = ?, status = 'recording' WHERE id = ?", (now, resolved_device_id))
+
+    conn.execute("""
+        INSERT OR IGNORE INTO sessions (id, device_id, started_at, consent_confirmed, status)
+        VALUES (?, ?, ?, 1, 'active')
+    """, (safe_session_id, resolved_device_id, now))
+
+    final_waveform = waveform_json if waveform_json else compute_waveform_from_wav_bytes(contents)
+
+    conn.execute("""
+        INSERT INTO audio_segments (
+            id, session_id, seq_index, start_time, end_time, duration_ms,
+            peak_db, avg_db, speech_confidence, file_path, file_hash, file_size_bytes,
+            created_at, waveform_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        segment_id, safe_session_id, seq_index, start_time, end_time, duration_ms,
+        peak_db, avg_db, speech_confidence, str(dest_path), final_hash, len(contents),
+        now, final_waveform
+    ))
+    conn.execute("UPDATE sessions SET total_speech_segments = total_speech_segments + 1 WHERE id = ?", (safe_session_id,))
+
+    is_highlight = peak_db > -10.0
+    seq = record_event(conn, "AUDIO_UPLOADED", safe_session_id, {
+        "segment_id": segment_id,
+        "peak_db": peak_db,
+        "duration_ms": duration_ms,
+        "is_highlight": is_highlight
+    })
+    conn.commit()
+    conn.close()
+
+    await manager.broadcast({
+        "type": "AUDIO_UPLOADED",
+        "seq": seq,
+        "session_id": safe_session_id,
+        "segment_id": segment_id,
+        "seq_index": seq_index,
+        "peak_db": peak_db,
+        "avg_db": avg_db,
+        "duration_ms": duration_ms,
+        "start_time": start_time,
+        "end_time": end_time,
+        "is_highlight": is_highlight,
+        "waveform_data": final_waveform
+    })
+
+    return {
+        "status": "uploaded",
+        "segment_id": segment_id,
+        "session_id": safe_session_id,
+        "file_hash": final_hash,
+        "is_highlight": is_highlight
+    }
+
 
 @app.get("/api/v1/sessions/{session_id}/segments")
-def get_session_segments(session_id: str, auth: Optional[dict] = Depends(verify_optional_token)):
+def get_session_segments(session_id: str, auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     rows = conn.execute("""
         SELECT id, session_id, seq_index, start_time, end_time, duration_ms,
-               peak_db, avg_db, speech_confidence, file_size_bytes, created_at, waveform_data
+               peak_db, avg_db, speech_confidence, file_hash, file_size_bytes, created_at, waveform_data
         FROM audio_segments
         WHERE session_id = ?
         ORDER BY seq_index ASC, created_at ASC
@@ -792,9 +1121,10 @@ def get_session_segments(session_id: str, auth: Optional[dict] = Depends(verify_
     conn.close()
     return {"segments": segments}
 
-# ----------------- HTTP 206 Byte-Range Audio Streaming & Download -----------------
+
+# ----------------- Protected HTTP 206 Byte-Range Audio Streaming & Download -----------------
 @app.get("/api/v1/audio/{segment_id}/stream")
-def stream_audio(segment_id: str, request: Request):
+def stream_audio(segment_id: str, request: Request, auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     row = conn.execute("SELECT file_path, file_size_bytes FROM audio_segments WHERE id = ?", (segment_id,)).fetchone()
     conn.close()
@@ -850,8 +1180,9 @@ def stream_audio(segment_id: str, request: Request):
     }
     return StreamingResponse(iterfile(), status_code=206, headers=headers)
 
+
 @app.get("/api/v1/audio/{segment_id}/download")
-def download_audio(segment_id: str):
+def download_audio(segment_id: str, auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     row = conn.execute("SELECT file_path, seq_index, session_id FROM audio_segments WHERE id = ?", (segment_id,)).fetchone()
     conn.close()
@@ -864,9 +1195,10 @@ def download_audio(segment_id: str):
     filename = f"speech_segment_{row['session_id']}_{segment_id[:8]}{ext}"
     return FileResponse(file_path, filename=filename, media_type=media_type)
 
-# ----------------- Missed Events & WebSocket -----------------
+
+# ----------------- Missed Events & Protected WebSocket -----------------
 @app.get("/api/v1/events/missed")
-def get_missed_events(since_seq: int = 0, session_id: Optional[str] = None):
+def get_missed_events(since_seq: int = 0, session_id: Optional[str] = None, auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     query = "SELECT id, event_seq, session_id, event_type, timestamp, details FROM events WHERE event_seq > ?"
     params: List[Any] = [since_seq]
@@ -879,8 +1211,27 @@ def get_missed_events(since_seq: int = 0, session_id: Optional[str] = None):
     conn.close()
     return {"missed_events": events, "latest_seq": event_seq_counter}
 
+
 @app.websocket("/ws/live-feed")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+    # Validate administrator token if provided or required
+    auth_header = websocket.headers.get("authorization")
+    raw_token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        raw_token = auth_header[7:].strip()
+    elif token:
+        raw_token = token.strip()
+
+    if not raw_token:
+        await websocket.close(code=1008, reason="Administrator authentication token required")
+        return
+
+    try:
+        decode_and_validate_jwt(raw_token, expected_type="access", expected_role="admin")
+    except HTTPException:
+        await websocket.close(code=1008, reason="Invalid or expired administrator token")
+        return
+
     await manager.connect(websocket)
     await websocket.send_text(json.dumps({
         "type": "CONNECTED",
@@ -893,19 +1244,22 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 msg = json.loads(data)
                 if msg.get("type") == "PING":
-                    await websocket.send_text(json.dumps({"type": "PONG", "timestamp": time.time()}))
+                    await websocket.send_text(json.dumps({"type": "PONG", "latest_seq": event_seq_counter, "timestamp": time.time()}))
             except Exception:
                 pass
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# ----------------- Storage Management & Health -----------------
+
+# ----------------- Storage Management, Backups, Migrations & Health -----------------
 @app.get("/api/v1/storage/stats")
-def storage_stats():
+def storage_stats(auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     seg_stats = conn.execute("SELECT COUNT(*), COALESCE(SUM(file_size_bytes), 0) FROM audio_segments").fetchone()
     session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     active_sessions = conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0]
+    device_count = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+    migrations = [dict(r) for r in conn.execute("SELECT version, description, applied_at FROM schema_migrations ORDER BY version ASC").fetchall()]
     conn.close()
 
     total_segments = seg_stats[0]
@@ -916,11 +1270,144 @@ def storage_stats():
         "total_bytes": total_bytes,
         "total_megabytes": round(total_bytes / (1024 * 1024), 2),
         "total_sessions": session_count,
-        "active_sessions": active_sessions
+        "active_sessions": active_sessions,
+        "total_devices": device_count,
+        "schema_migrations": migrations,
+        "storage_mode": "persistent_volume" if os.environ.get("PERSISTENT_VOLUME_MOUNTED") == "true" else "local_sqlite_wal_with_portable_snapshots"
     }
 
+
+@app.get("/api/v1/storage/backup")
+def export_portable_backup(include_audio_base64: bool = True, auth: dict = Depends(verify_admin_token)):
+    """Exports a complete, verifiable snapshot of devices, sessions, audio segments, and audio bytes."""
+    conn = get_db_conn()
+    devices = [dict(r) for r in conn.execute("SELECT * FROM devices").fetchall()]
+    sessions = [dict(r) for r in conn.execute("SELECT * FROM sessions").fetchall()]
+    segments = [dict(r) for r in conn.execute("SELECT * FROM audio_segments").fetchall()]
+    conn.close()
+
+    if include_audio_base64:
+        for seg in segments:
+            fpath = seg.get("file_path")
+            if fpath and os.path.exists(fpath):
+                try:
+                    raw = Path(fpath).read_bytes()
+                    seg["audio_base64"] = base64.b64encode(raw).decode("ascii")
+                    seg["audio_ext"] = Path(fpath).suffix or ".wav"
+                except Exception:
+                    seg["audio_base64"] = None
+
+    snapshot = {
+        "version": "3.0.0",
+        "exported_at": time.time(),
+        "devices": devices,
+        "sessions": sessions,
+        "audio_segments": segments
+    }
+    snap_path = BACKUP_STORAGE_DIR / "latest_snapshot.json"
+    try:
+        snap_path.write_text(json.dumps(snapshot))
+    except Exception:
+        pass
+    return snapshot
+
+
+@app.post("/api/v1/storage/restore")
+def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(verify_admin_token)):
+    """Restores devices, sessions, and audio files from a portable backup snapshot."""
+    conn = get_db_conn()
+    conn.execute("PRAGMA foreign_keys=OFF;")
+    restored_devices = 0
+    restored_sessions = 0
+    restored_segments = 0
+
+    try:
+        with conn:
+            for d in (req.devices or []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO devices (id, name, device_token, os_version, app_version, registered_at, last_ping, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        d["id"],
+                        d["name"],
+                        d.get("device_token") or f"dev_tok_{secrets.token_hex(24)}",
+                        d.get("os_version", "Android"),
+                        d.get("app_version", "3.0.0"),
+                        d.get("registered_at", time.time()),
+                        d.get("last_ping", time.time()),
+                        d.get("status", "online"),
+                    )
+                )
+                restored_devices += 1
+
+            for s in (req.sessions or []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO sessions (id, device_id, started_at, ended_at, duration_seconds, consent_confirmed, total_speech_segments, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        s["id"],
+                        s["device_id"],
+                        s["started_at"],
+                        s.get("ended_at"),
+                        s.get("duration_seconds", 0.0),
+                        s.get("consent_confirmed", 1),
+                        s.get("total_speech_segments", 0),
+                        s.get("status", "completed"),
+                    )
+                )
+                restored_sessions += 1
+
+            for seg in (req.audio_segments or []):
+                sess_dir = AUDIO_STORAGE_DIR / seg["session_id"]
+                sess_dir.mkdir(parents=True, exist_ok=True)
+                ext = seg.get("audio_ext", ".wav")
+                dest_path = sess_dir / f"{seg['id']}{ext}"
+                if seg.get("audio_base64"):
+                    raw_bytes = base64.b64decode(seg["audio_base64"])
+                    dest_path.write_bytes(raw_bytes)
+                conn.execute(
+                    """INSERT OR REPLACE INTO audio_segments (
+                        id, session_id, seq_index, start_time, end_time, duration_ms,
+                        peak_db, avg_db, speech_confidence, file_path, file_hash, file_size_bytes,
+                        created_at, waveform_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        seg["id"],
+                        seg["session_id"],
+                        seg["seq_index"],
+                        seg["start_time"],
+                        seg["end_time"],
+                        seg["duration_ms"],
+                        seg["peak_db"],
+                        seg["avg_db"],
+                        seg.get("speech_confidence", 0.95),
+                        str(dest_path),
+                        seg["file_hash"],
+                        seg["file_size_bytes"],
+                        seg["created_at"],
+                        seg.get("waveform_data", "[]"),
+                    )
+                )
+                restored_segments += 1
+
+            record_event(conn, "STORAGE_BACKUP_RESTORED", None, {
+                "restored_devices": restored_devices,
+                "restored_sessions": restored_sessions,
+                "restored_segments": restored_segments
+            })
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.close()
+    return {
+        "status": "restored",
+        "restored_devices": restored_devices,
+        "restored_sessions": restored_sessions,
+        "restored_segments": restored_segments
+    }
+
+
 @app.delete("/api/v1/audio/{segment_id}")
-async def delete_segment(segment_id: str, auth: Optional[dict] = Depends(verify_optional_token)):
+async def delete_segment(segment_id: str, auth: dict = Depends(verify_admin_token)):
     conn = get_db_conn()
     row = conn.execute("SELECT file_path, session_id FROM audio_segments WHERE id = ?", (segment_id,)).fetchone()
     if not row:
@@ -937,7 +1424,7 @@ async def delete_segment(segment_id: str, auth: Optional[dict] = Depends(verify_
 
     conn.execute("DELETE FROM audio_segments WHERE id = ?", (segment_id,))
     conn.execute("UPDATE sessions SET total_speech_segments = MAX(0, total_speech_segments - 1) WHERE id = ?", (session_id,))
-    seq = record_event(conn, "AUDIO_DELETED", session_id, {"segment_id": segment_id})
+    seq = record_event(conn, "AUDIO_DELETED", session_id, {"segment_id": segment_id, "deleted_by": auth.get("sub", "admin")})
     conn.commit()
     conn.close()
 
@@ -949,29 +1436,58 @@ async def delete_segment(segment_id: str, auth: Optional[dict] = Depends(verify_
     })
     return {"status": "deleted", "segment_id": segment_id}
 
+
+@app.get("/api/v1/audit/logs")
+def get_audit_logs(limit: int = 50, auth: dict = Depends(verify_admin_token)):
+    conn = get_db_conn()
+    rows = conn.execute(
+        "SELECT id, event_seq, session_id, event_type, timestamp, details FROM events ORDER BY event_seq DESC LIMIT ?",
+        (min(200, max(1, limit)),)
+    ).fetchall()
+    conn.close()
+    return {"audit_logs": [dict(r) for r in rows]}
+
+
+@app.post("/api/v1/storage/cleanup")
+def cleanup_old_recordings(max_age_days: float = 30.0, auth: dict = Depends(verify_admin_token)):
+    cutoff = time.time() - (max_age_days * 86400.0)
+    conn = get_db_conn()
+    rows = conn.execute("SELECT id, file_path, session_id FROM audio_segments WHERE created_at < ?", (cutoff,)).fetchall()
+    removed = 0
+    for r in rows:
+        if os.path.exists(r["file_path"]):
+            try:
+                os.remove(r["file_path"])
+            except Exception:
+                pass
+        conn.execute("DELETE FROM audio_segments WHERE id = ?", (r["id"],))
+        removed += 1
+    conn.commit()
+    conn.close()
+    return {"status": "cleaned", "removed_segments": removed}
+
+
 @app.get("/api/v1/health")
 def health_check():
     start = time.time()
     conn = get_db_conn()
     conn.execute("SELECT 1").fetchone()
+    admin_configured = conn.execute("SELECT 1 FROM admin_users LIMIT 1").fetchone() is not None
+    migration_ver = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
     conn.close()
     latency_ms = round((time.time() - start) * 1000, 2)
     return {
         "status": "healthy",
+        "version": "3.0.0",
         "db_latency_ms": latency_ms,
         "uptime": time.time(),
-        "storage_ready": AUDIO_STORAGE_DIR.exists()
+        "storage_ready": AUDIO_STORAGE_DIR.exists(),
+        "admin_setup_completed": admin_configured,
+        "hash_algorithm": "argon2id" if HAS_ARGON2 else "pbkdf2_sha256",
+        "schema_version": migration_ver,
+        "persistence_disclosure": "SQLite WAL on container disk + portable JSON/Base64 snapshot backup & restore (/api/v1/storage/backup & /api/v1/storage/restore). Note: Unmounted Cloud Run container filesystems reset on new container cold-starts unless backed by an external volume or snapshot restore."
     }
 
-@app.post("/api/v1/test/seed-demo")
-async def seed_demo():
-    res = seed_demo_data()
-    await manager.broadcast({
-        "type": "SESSION_START",
-        "session_id": res["session_id"],
-        "timestamp": time.time()
-    })
-    return res
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, ExternalLink, Copy, Check, Smartphone, ShieldCheck, Github, Sparkles } from 'lucide-react';
+import { Download, ExternalLink, Copy, Check, Smartphone, ShieldCheck, KeyRound } from 'lucide-react';
 import { PWAInstallButton } from './PWAInstallButton';
 
 export const DownloadsView: React.FC = () => {
@@ -13,30 +13,30 @@ export const DownloadsView: React.FC = () => {
   const apkList = [
     {
       id: 'runner',
-      name: 'Scream Runner APK (v2.6.0 Pure SDK Release)',
+      name: 'Scream Runner APK (v3.0.0 Pure SDK Release)',
       filename: 'scream-runner.apk',
-      cacheBustedFilename: 'scream-runner-v2.6.0.apk',
-      version: 'v2.6.0 (minSdk 23 / targetSdk 34 Android 14)',
+      cacheBustedFilename: 'scream-runner-v3.0.apk',
+      version: 'v3.0.0 (versionCode 6 · minSdk 23 / targetSdk 34 Android 14–16)',
       packageId: 'com.screamrunner.arcade',
       launcher: 'com.screamrunner.game.MainActivity',
-      size: '41.5 KB (41,531 bytes)',
-      sha256: 'caf4d2f03c88cfcc22148a41dc35ab95c8832c5e2410ec145ccb485cc73fb257',
+      size: '49 KB (Pure Android SDK)',
+      sha256: '7d81ab82e2241b03425ee8334c81ea6e4efc43aa87a02a5b05977c539c61a693',
       description:
-        'Pure Android SDK Release APK (zero third-party libraries, 9 files total). Starts in Touch Jump mode by default; microphone & VAD telemetry activate only after explicit user consent with visible HUD & notification stop controls and app-private local storage.',
+        'Delta-time 60 FPS voice/touch endless runner with real-time FPS & frame-time (ms) HUD, Title/Pause/GameOver screens, 3 obstacle types, synthesized AudioTrack SFX with mute toggle, Android 14–16 foregroundServiceType="microphone" service with 1-tap STOP notification, adaptive noise-floor VAD (300ms pre-roll / 500ms post-roll), hardware AAC/M4A + WAV encoding, SHA-256 verification, and X-Device-Token authenticated uploads.',
       accent: 'cyan',
     },
     {
       id: 'dashboard',
-      name: "Sam's Dashboard APK (v2.6.0 Pure SDK Release)",
+      name: "Sam's Dashboard APK (v3.0.0 Pure SDK Release)",
       filename: 'sams-dashboard.apk',
-      cacheBustedFilename: 'sams-dashboard-v2.6.0.apk',
-      version: 'v2.6.0 (minSdk 23 / targetSdk 34 Android 14)',
+      cacheBustedFilename: 'sams-dashboard-v3.0.apk',
+      version: 'v3.0.0 (versionCode 6 · minSdk 23 / targetSdk 34 Android 14–16)',
       packageId: 'com.sams.telemetry.console',
       launcher: 'com.samsdashboard.admin.DashboardActivity',
-      size: '37.5 KB (37,491 bytes)',
-      sha256: 'e6a08b55628900d243d0777e4b7ff83bc21dd1f5e1f56cd6dd924712e37becd7',
+      size: '41 KB (Pure Android SDK)',
+      sha256: '27ab5447edad6dad68912b46da6cc5651d850c4c09d6e4f086897d919180ef08',
       description:
-        'Pure Android SDK Release APK (zero third-party libraries, 10 files total). Requests only INTERNET permission (zero dangerous permissions), removes all automatic onCreate credential beacons, includes offline waveform/audio calibration, and syncs live telemetry on demand.',
+        'Hardened administrator console with First-Time Admin Setup (Argon2id password hashing), One-Time Emergency Recovery Key password reset, Android Keystore (AES/GCM/NoPadding) encrypted token storage, automatic refresh-token rotation, HTTP 206 byte-range audio scrubbing, 0.75x–2.0x speed controls, and > -10 dB peak filtering.',
       accent: 'emerald',
     },
   ];
@@ -48,16 +48,18 @@ export const DownloadsView: React.FC = () => {
   };
 
   return (
-    <div className="flex flex-col h-full bg-[#080B11] border border-slate-800 rounded-2xl overflow-hidden shadow-2xl p-6 text-slate-200">
-      {/* Zero-Warning Google WebAPK Banner */}
-      <div className="mb-6 p-4 rounded-2xl bg-gradient-to-r from-emerald-950/60 via-slate-900 to-cyan-950/60 border border-emerald-500/40 flex flex-wrap items-center justify-between gap-4">
-        <div className="space-y-1 max-w-2xl">
-          <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
-            <Sparkles className="w-4 h-4" />
-            <span>ZERO PLAY PROTECT WARNINGS OPTION: 1-TAP GOOGLE WEBAPK (PWA)</span>
+    <div className="flex flex-col h-full bg-[#080B11] border border-slate-800 rounded-2xl overflow-hidden shadow-2xl p-6 text-slate-200 overflow-y-auto">
+      {/* Administrator First-Time Setup & Sign-In Guide */}
+      <div className="mb-6 p-4 rounded-2xl bg-gradient-to-r from-cyan-950/70 via-slate-900 to-emerald-950/70 border border-cyan-500/40 flex flex-wrap items-center justify-between gap-4">
+        <div className="space-y-1.5 max-w-3xl">
+          <div className="flex items-center gap-2 text-cyan-400 font-bold text-sm">
+            <KeyRound className="w-4 h-4" />
+            <span>FIRST-TIME ADMINISTRATOR SETUP &amp; SIGN-IN (v3.0 ZERO DEFAULT PASSWORDS)</span>
           </div>
           <p className="text-xs text-slate-300 leading-relaxed">
-            Google Play Protect shows an "Unknown developer" prompt on self-signed <code className="text-cyan-300">.apk</code> files downloaded outside the Play Store. You can install the full app suite via Chrome's official Google WebAPK minting server with <strong>0% warnings</strong>, or download the standalone <code className="text-emerald-300">v2.6.0</code> Pure SDK Release APKs below:
+            1. For security compliance, all hardcoded default passwords have been removed in <strong>v3.0</strong>.{' '}
+            2. On your first visit to <strong>Sam&apos;s Dashboard</strong> (Web or Android APK), tap <strong>SIGN IN / SETUP</strong> to create your administrator username and password (minimum 10 characters, hashed with <strong>Argon2id</strong>).{' '}
+            3. Save the generated <strong>One-Time Emergency Recovery Key</strong> (<code className="text-emerald-300 font-mono">SR-XXXX-...</code>) to reset your password anytime without database wipes.
           </p>
         </div>
         <PWAInstallButton />
@@ -66,10 +68,10 @@ export const DownloadsView: React.FC = () => {
       <div className="mb-6 border-b border-slate-800 pb-4">
         <div className="flex items-center gap-2.5 text-cyan-400 font-bold text-lg">
           <Smartphone className="w-5 h-5" />
-          <span>STANDALONE ANDROID RELEASE APKs (v2.6.0 · PURE ANDROID SDK · v1 + v2 + v3 SIGNED)</span>
+          <span>STANDALONE ANDROID RELEASE APKs (v3.0.0 · PURE ANDROID SDK · v1 + v2 + v3 SIGNED)</span>
         </div>
         <p className="text-xs text-slate-400 mt-1">
-          Clean package IDs (<code className="text-cyan-300">com.screamrunner.arcade</code> & <code className="text-emerald-300">com.sams.telemetry.console</code>) resolve previous signature conflicts (<code className="text-rose-300">INSTALL_FAILED_UPDATE_INCOMPATIBLE</code>) and strip 3.1 MB of third-party reflection bytecode.
+          Built with official Gradle AGP 8.1.4 (<code className="text-cyan-300">compileSdk 34</code> / <code className="text-emerald-300">targetSdk 34</code>) and signed with persistent release keystores so updates install cleanly over previous builds.
         </p>
       </div>
 
@@ -111,7 +113,7 @@ export const DownloadsView: React.FC = () => {
                 <p className="text-xs text-slate-300 leading-relaxed mb-4">{apk.description}</p>
 
                 <div className="bg-black/40 rounded-lg p-2.5 border border-slate-800 text-[10px] font-mono text-slate-400 mb-6 break-all">
-                  <span className="text-slate-500 block mb-0.5">SHA-256 Checksum (Release v2.6.0):</span>
+                  <span className="text-slate-500 block mb-0.5">SHA-256 Checksum (Release v3.0.0):</span>
                   {apk.sha256}
                 </div>
               </div>
@@ -141,7 +143,7 @@ export const DownloadsView: React.FC = () => {
                   className="w-full py-2 px-3 text-xs font-medium text-slate-300 hover:text-white bg-slate-900 hover:bg-slate-800 rounded-lg border border-slate-800 transition-colors flex items-center justify-center gap-1.5"
                 >
                   <ExternalLink className="w-3.5 h-3.5" />
-                  Direct Canonical Link (/downloads/{apk.filename})
+                  Canonical Link (/downloads/{apk.filename})
                 </a>
 
                 <button
@@ -151,7 +153,7 @@ export const DownloadsView: React.FC = () => {
                   {copiedLink === apk.id ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-emerald-400" />
-                      <span className="text-emerald-400">Copied Direct Release URL to Clipboard</span>
+                      <span className="text-emerald-400">Copied Direct v3.0 URL to Clipboard</span>
                     </>
                   ) : (
                     <>
@@ -166,33 +168,33 @@ export const DownloadsView: React.FC = () => {
         })}
       </div>
 
-      {/* Security & Diagnostic Summary */}
+      {/* Security & Architecture Summary */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-300 space-y-2">
           <h4 className="font-semibold text-white flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            Root Causes Fixed in v2.6.0
+            What Was Repaired &amp; Hardened in v3.0.0
           </h4>
           <ul className="list-disc list-inside space-y-1 text-slate-400">
             <li>
-              <strong className="text-slate-200">Fixed "App not installed" (Signature Conflict):</strong> Updated package ID to <code className="text-cyan-300">com.screamrunner.arcade</code> and removed double-signing + unprotected <code className="text-cyan-300">META-INF/app-metadata.properties</code>.
+              <strong className="text-slate-200">True Android 14–16 Foreground Service:</strong> <code className="text-cyan-300">SmartRecordingService</code> extends <code className="text-cyan-300">android.app.Service</code> with <code className="text-cyan-300">foregroundServiceType=&quot;microphone&quot;</code> and 1-tap notification STOP action.
             </li>
             <li>
-              <strong className="text-slate-200">Removed 3.1 MB Third-Party Bytecode:</strong> Replaced <code className="text-cyan-300">okhttp3</code> & <code className="text-cyan-300">gson</code> with pure Android SDK (<code className="text-emerald-300">HttpURLConnection</code> + <code className="text-emerald-300">org.json</code>).
+              <strong className="text-slate-200">Zero UI-Thread Frame Stutter:</strong> Removed 60Hz <code className="text-cyan-300">runOnUiThread()</code> calls from <code className="text-cyan-300">MainActivity.updatePhysics()</code> and added nanosecond delta-time physics + frame-time (<code className="text-cyan-300">ms</code>) HUD.
             </li>
             <li>
-              <strong className="text-slate-200">Removed Auto-Login & Premature Mic Access:</strong> Zero microphone or network activity on launch; explicit consent required with visible notification & stop controls.
+              <strong className="text-slate-200">Argon2id + Android Keystore + Device Tokens:</strong> Replaced default passwords with first-time setup, AES-GCM Android Keystore token storage, and <code className="text-emerald-300">X-Device-Token</code> upload authentication.
             </li>
           </ul>
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-300 space-y-2">
           <h4 className="font-semibold text-white flex items-center gap-2">
-            <Github className="w-4 h-4 text-cyan-400" />
-            Android Sideloading & Play Protect Note
+            <Smartphone className="w-4 h-4 text-cyan-400" />
+            Android Installation &amp; Upgrade Notes
           </h4>
           <p className="text-slate-400 leading-relaxed">
-            On Android, if Google Play Protect shows a prompt for an unrecognized self-signed developer certificate, tap <strong>"More details" → "Install anyway"</strong> (do not tap the blue "OK" button, which cancels the install and shows "App not installed").
+            Both v3.0 APKs are signed with the same release keys used in v2.6/v2.7 so you can install them directly as an update without <code className="text-rose-300">INSTALL_FAILED_UPDATE_INCOMPATIBLE</code>. If Android Play Protect displays an unrecognized developer prompt on sideloading, tap <strong>&quot;More details&quot; → &quot;Install anyway&quot;</strong>.
           </p>
         </div>
       </div>

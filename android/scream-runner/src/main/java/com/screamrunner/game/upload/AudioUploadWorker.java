@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -22,14 +23,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * AudioUploadWorker handles user-consented session registration and HTTPS upload
- * of locally saved WAV clips using pure Android SDK (HttpURLConnection & org.json).
+ * AudioUploadWorker v3.0:
+ * Handles authenticated device enrollment (X-Device-Token), user-consented session registration,
+ * interruption logging, persistent offline upload queueing, and HTTPS upload with SHA-256 deduplication.
  */
 public class AudioUploadWorker {
     private static final String TAG = "AudioUploadWorker";
-    private static final String PREFS_NAME = "scream_runner_prefs";
+    private static final String PREFS_NAME = "scream_runner_prefs_v3";
     private static final String KEY_BASE_URL = "backend_base_url";
     private static final String KEY_DEVICE_ID = "registered_device_id";
+    private static final String KEY_DEVICE_TOKEN = "registered_device_token";
+    private static final String KEY_PENDING_QUEUE = "pending_upload_queue_json";
     public static final String DEFAULT_CLOUD_URL = "https://ais-pre-3fyydrqqukwg2upmm34wb7-344668128828.asia-northeast1.run.app";
 
     private static final ExecutorService executor = Executors.newCachedThreadPool();
@@ -78,64 +82,118 @@ public class AudioUploadWorker {
         return generated;
     }
 
+    public static String getDeviceToken(Context context) {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_DEVICE_TOKEN, null);
+    }
+
+    private static synchronized String ensureDeviceEnrolledSync(Context appContext) {
+        String baseUrl = getBaseUrl(appContext);
+        String deviceName = getDeviceName();
+        String deviceId = getOrInitDeviceId(appContext);
+        SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String existingTok = prefs.getString(KEY_DEVICE_TOKEN, null);
+
+        try {
+            JSONObject devPayload = new JSONObject();
+            devPayload.put("id", deviceId);
+            devPayload.put("name", deviceName);
+            devPayload.put("os_version", "Android " + Build.VERSION.RELEASE);
+            devPayload.put("app_version", "3.0.0");
+            String regResp = postJson(baseUrl + "/api/v1/devices/register", devPayload.toString(), null);
+            if (regResp != null) {
+                JSONObject resObj = new JSONObject(regResp);
+                if (resObj.has("device_id")) {
+                    deviceId = resObj.getString("device_id");
+                }
+                if (resObj.has("device_token")) {
+                    existingTok = resObj.getString("device_token");
+                }
+                prefs.edit()
+                        .putString(KEY_DEVICE_ID, deviceId)
+                        .putString(KEY_DEVICE_TOKEN, existingTok)
+                        .apply();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Device enrollment notice: " + e.getMessage());
+        }
+        return existingTok;
+    }
+
     public static void registerDeviceAndStartSession(Context context, String sessionId) {
         final Context appContext = context.getApplicationContext();
         executor.execute(() -> {
             String baseUrl = getBaseUrl(appContext);
             String deviceName = getDeviceName();
+            String deviceToken = ensureDeviceEnrolledSync(appContext);
             String deviceId = getOrInitDeviceId(appContext);
 
             try {
-                JSONObject devPayload = new JSONObject();
-                devPayload.put("id", deviceId);
-                devPayload.put("name", deviceName);
-                String regResp = postJson(baseUrl + "/api/v1/devices/register", devPayload.toString());
-                if (regResp != null) {
-                    JSONObject resObj = new JSONObject(regResp);
-                    if (resObj.has("device_id")) {
-                        deviceId = resObj.getString("device_id");
-                        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                                .edit()
-                                .putString(KEY_DEVICE_ID, deviceId)
-                                .apply();
-                    }
-                }
-
                 JSONObject sessPayload = new JSONObject();
                 sessPayload.put("session_id", sessionId);
                 sessPayload.put("device_id", deviceId);
                 sessPayload.put("device_name", deviceName);
                 sessPayload.put("consent_confirmed", true);
-                String sessResp = postJson(baseUrl + "/api/v1/sessions/start", sessPayload.toString());
+                String sessResp = postJson(baseUrl + "/api/v1/sessions/start", sessPayload.toString(), deviceToken);
                 if (sessResp != null && statusListener != null) {
                     statusListener.onSessionRegistered(sessionId, deviceName);
                 }
+                flushPendingQueue(appContext);
             } catch (Exception e) {
                 Log.w(TAG, "Session registration notice: " + e.getMessage());
             }
         });
     }
 
+    public static void reportInterruption(Context context, String sessionId, String reason, int durationMs) {
+        if (sessionId == null || context == null) return;
+        final Context appContext = context.getApplicationContext();
+        executor.execute(() -> {
+            try {
+                String baseUrl = getBaseUrl(appContext);
+                String deviceToken = getDeviceToken(appContext);
+                if (deviceToken == null) {
+                    deviceToken = ensureDeviceEnrolledSync(appContext);
+                }
+                JSONObject payload = new JSONObject();
+                payload.put("session_id", sessionId);
+                payload.put("event_type", "INTERRUPTION");
+                payload.put("reason", reason);
+                payload.put("duration_ms", durationMs);
+                postJson(baseUrl + "/api/v1/sessions/interruption", payload.toString(), deviceToken);
+            } catch (Exception ignored) {}
+        });
+    }
+
     public static void pingDevice(Context context, String statusVal) {
+        if (context == null) return;
         final Context appContext = context.getApplicationContext();
         executor.execute(() -> {
             try {
                 String baseUrl = getBaseUrl(appContext);
                 String deviceId = getOrInitDeviceId(appContext);
-                postJson(baseUrl + "/api/v1/devices/" + deviceId + "/ping?status_val=" + statusVal, "{}");
+                String deviceToken = getDeviceToken(appContext);
+                if (deviceToken == null) {
+                    deviceToken = ensureDeviceEnrolledSync(appContext);
+                }
+                postJson(baseUrl + "/api/v1/devices/" + deviceId + "/ping?status_val=" + statusVal, "{}", deviceToken);
             } catch (Exception ignored) {}
         });
     }
 
     public static void stopSession(Context context, String sessionId) {
-        if (sessionId == null) return;
+        if (sessionId == null || context == null) return;
         final Context appContext = context.getApplicationContext();
         executor.execute(() -> {
             try {
                 String baseUrl = getBaseUrl(appContext);
+                String deviceToken = getDeviceToken(appContext);
+                if (deviceToken == null) {
+                    deviceToken = ensureDeviceEnrolledSync(appContext);
+                }
                 JSONObject payload = new JSONObject();
                 payload.put("session_id", sessionId);
-                postJson(baseUrl + "/api/v1/sessions/stop", payload.toString());
+                postJson(baseUrl + "/api/v1/sessions/stop", payload.toString(), deviceToken);
                 pingDevice(appContext, "online");
             } catch (Exception e) {
                 Log.w(TAG, "Session stop notice: " + e.getMessage());
@@ -143,7 +201,85 @@ public class AudioUploadWorker {
         });
     }
 
-    private static String postJson(String urlStr, String jsonBody) throws Exception {
+    private static synchronized void saveToPendingQueue(Context context, JSONObject item) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONArray arr = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
+            String hash = item.optString("sha256Hash", "");
+            for (int i = 0; i < arr.length(); i++) {
+                if (hash.equals(arr.getJSONObject(i).optString("sha256Hash", ""))) {
+                    return; // Deduplicate in local queue
+                }
+            }
+            arr.put(item);
+            prefs.edit().putString(KEY_PENDING_QUEUE, arr.toString()).apply();
+        } catch (Exception ignored) {}
+    }
+
+    public static int getPendingQueueSize(Context context) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONArray arr = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
+            return arr.length();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    public static void flushPendingQueue(Context context) {
+        final Context appContext = context.getApplicationContext();
+        executor.execute(() -> {
+            try {
+                SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONArray arr = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
+                if (arr.length() == 0) return;
+
+                String deviceToken = getDeviceToken(appContext);
+                if (deviceToken == null) {
+                    deviceToken = ensureDeviceEnrolledSync(appContext);
+                }
+
+                JSONArray remaining = new JSONArray();
+                String uploadUrl = getBaseUrl(appContext) + "/api/v1/audio/upload";
+                String deviceId = getOrInitDeviceId(appContext);
+                String deviceName = getDeviceName();
+
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject job = arr.getJSONObject(i);
+                    String filePath = job.optString("filePath", "");
+                    if (!new File(filePath).exists()) continue;
+                    try {
+                        String segId = executeMultipartUpload(
+                                uploadUrl,
+                                deviceToken,
+                                job.optString("sessionId", "sess_recovered"),
+                                deviceId,
+                                deviceName,
+                                job.optInt("seqIndex", 1),
+                                filePath,
+                                job.optString("sha256Hash", ""),
+                                job.optLong("startTimeMs", System.currentTimeMillis()),
+                                job.optLong("endTimeMs", System.currentTimeMillis()),
+                                job.optInt("durationMs", 1000),
+                                job.optDouble("peakDb", -12.0),
+                                job.optDouble("avgDb", -20.0),
+                                job.optString("waveformJson", "[]")
+                        );
+                        if (segId == null) {
+                            remaining.put(job);
+                        } else if (statusListener != null) {
+                            statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
+                        }
+                    } catch (Exception e) {
+                        remaining.put(job);
+                    }
+                }
+                prefs.edit().putString(KEY_PENDING_QUEUE, remaining.toString()).apply();
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private static String postJson(String urlStr, String jsonBody, String deviceToken) throws Exception {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(urlStr);
@@ -153,6 +289,9 @@ public class AudioUploadWorker {
             conn.setReadTimeout(15000);
             conn.setDoOutput(true);
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            if (deviceToken != null && !deviceToken.isEmpty()) {
+                conn.setRequestProperty("X-Device-Token", deviceToken);
+            }
             byte[] bytes = jsonBody.getBytes(StandardCharsets.UTF_8);
             conn.setFixedLengthStreamingMode(bytes.length);
             try (OutputStream os = conn.getOutputStream()) {
@@ -202,6 +341,10 @@ public class AudioUploadWorker {
             int attempt = 0;
             int maxAttempts = 3;
             long backoffMs = 1500;
+            String deviceToken = getDeviceToken(appContext);
+            if (deviceToken == null) {
+                deviceToken = ensureDeviceEnrolledSync(appContext);
+            }
             String deviceId = getOrInitDeviceId(appContext);
             String deviceName = getDeviceName();
 
@@ -211,6 +354,7 @@ public class AudioUploadWorker {
                     String uploadUrl = getBaseUrl(appContext) + "/api/v1/audio/upload";
                     String segId = executeMultipartUpload(
                             uploadUrl,
+                            deviceToken,
                             sessionId,
                             deviceId,
                             deviceName,
@@ -231,8 +375,25 @@ public class AudioUploadWorker {
                         }
                     }
                 } catch (Exception e) {
-                    if (attempt == maxAttempts && statusListener != null) {
-                        statusListener.onUploadError("Saved locally (" + e.getMessage() + ")");
+                    if (attempt == maxAttempts) {
+                        try {
+                            JSONObject job = new JSONObject();
+                            job.put("sessionId", sessionId);
+                            job.put("seqIndex", seqIndex);
+                            job.put("filePath", filePath);
+                            job.put("sha256Hash", sha256Hash);
+                            job.put("startTimeMs", startTimeMs);
+                            job.put("endTimeMs", endTimeMs);
+                            job.put("durationMs", durationMs);
+                            job.put("peakDb", peakDb);
+                            job.put("avgDb", avgDb);
+                            job.put("waveformJson", waveformJson);
+                            saveToPendingQueue(appContext, job);
+                            reportInterruption(appContext, sessionId, "Network upload queued offline", durationMs);
+                        } catch (Exception ignored) {}
+                        if (statusListener != null) {
+                            statusListener.onUploadError("Queued offline (will auto-retry)");
+                        }
                     }
                 }
 
@@ -250,6 +411,7 @@ public class AudioUploadWorker {
 
     private static String executeMultipartUpload(
             String uploadUrlStr,
+            String deviceToken,
             String sessionId,
             String deviceId,
             String deviceName,
@@ -271,6 +433,7 @@ public class AudioUploadWorker {
         String boundary = "----ScreamRunnerBoundary" + UUID.randomUUID().toString().replace("-", "");
         String lineEnd = "\r\n";
         String twoHyphens = "--";
+        String mimeType = file.getName().endsWith(".m4a") ? "audio/mp4" : "audio/wav";
 
         HttpURLConnection conn = null;
         try {
@@ -284,6 +447,9 @@ public class AudioUploadWorker {
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Connection", "Keep-Alive");
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+            if (deviceToken != null && !deviceToken.isEmpty()) {
+                conn.setRequestProperty("X-Device-Token", deviceToken);
+            }
 
             try (DataOutputStream dos = new DataOutputStream(conn.getOutputStream())) {
                 writeFormField(dos, boundary, "session_id", sessionId);
@@ -303,7 +469,7 @@ public class AudioUploadWorker {
 
                 dos.writeBytes(twoHyphens + boundary + lineEnd);
                 dos.writeBytes("Content-Disposition: form-data; name=\"audio_file\"; filename=\"" + file.getName() + "\"" + lineEnd);
-                dos.writeBytes("Content-Type: audio/wav" + lineEnd + lineEnd);
+                dos.writeBytes("Content-Type: " + mimeType + lineEnd + lineEnd);
 
                 try (FileInputStream fis = new FileInputStream(file)) {
                     byte[] buffer = new byte[8192];

@@ -4,10 +4,15 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
 
@@ -16,24 +21,28 @@ import com.screamrunner.game.upload.AudioUploadWorker;
 
 import java.io.File;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * SmartRecordingService:
- * Explicitly consent-based in-session audio telemetry controller.
- * Displays an ongoing system status notification while active, stores WAV segments
- * in secure app-private storage (getFilesDir()), and immediately releases the
- * microphone when stopped or when the activity leaves the foreground.
+ * SmartRecordingService v3.0:
+ * Android 14–16 compliant Foreground Microphone Service (foregroundServiceType="microphone").
+ * Explicitly consent-based, displays a persistent notification with a 1-tap STOP action,
+ * tracks audio focus interruptions, encodes AAC/M4A + WAV with 300ms pre-roll / 500ms post-roll,
+ * and supports user-controlled local retention and deletion.
  */
-public class SmartRecordingService implements CoordinatedAudioManager.AudioFrameListener, OfflineVadEngine.VadCallback {
-    private static final String TAG = "SmartRecordingCtrl";
-    private static final String CHANNEL_ID = "scream_runner_mic_status";
-    private static final int NOTIFICATION_ID = 4102;
+public class SmartRecordingService extends Service implements CoordinatedAudioManager.AudioFrameListener, OfflineVadEngine.VadCallback {
+    private static final String TAG = "SmartRecordingService";
+    private static final String CHANNEL_ID = "scream_runner_mic_status_v3";
+    private static final int NOTIFICATION_ID = 4103;
+    private static final String PREFS_RETENTION = "scream_runner_retention_prefs";
+    private static final String KEY_RETENTION_DAYS = "local_retention_days";
 
+    public static final String ACTION_START_SESSION = "com.screamrunner.arcade.START_MIC_SESSION";
     public static final String ACTION_STOP_FROM_NOTIFICATION = "com.screamrunner.arcade.STOP_MIC_SESSION";
+    public static final String EXTRA_SESSION_ID = "extra_session_id";
+    public static final String EXTRA_SYNC_ENABLED = "extra_sync_enabled";
 
     private static SmartRecordingService instance;
 
@@ -44,29 +53,107 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         return instance;
     }
 
-    private final Context appContext;
+    private Context appContext;
     private String sessionId;
-    private final OfflineVadEngine vadEngine;
+    private OfflineVadEngine vadEngine;
     private final AtomicInteger sequenceIndex = new AtomicInteger(1);
     private boolean isServiceActive = false;
     private boolean syncUploadEnabled = true;
-    private volatile double latestMeasuredDb = -20.0;
+    private volatile double latestMeasuredDb = -60.0;
+    private long interruptionStartedAtMs = 0;
+
+    private AudioManager audioManager;
+    private final AudioManager.OnAudioFocusChangeListener focusChangeListener = focusChange -> {
+        if (!isServiceActive) return;
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+            interruptionStartedAtMs = System.currentTimeMillis();
+            if (vadEngine != null) {
+                vadEngine.flushActiveSpeech();
+            }
+            if (syncUploadEnabled && sessionId != null) {
+                AudioUploadWorker.reportInterruption(appContext, sessionId, "Audio focus lost (incoming call or system audio interruption)", 500);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN && interruptionStartedAtMs > 0) {
+            int gapMs = (int) Math.max(100, System.currentTimeMillis() - interruptionStartedAtMs);
+            interruptionStartedAtMs = 0;
+            if (syncUploadEnabled && sessionId != null) {
+                AudioUploadWorker.reportInterruption(appContext, sessionId, "Audio focus restored after interruption", gapMs);
+            }
+        }
+    };
 
     private final Handler heartbeatHandler = new Handler(Looper.getMainLooper());
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
         public void run() {
             if (!isServiceActive) return;
-            if (syncUploadEnabled) {
+            if (syncUploadEnabled && appContext != null) {
                 AudioUploadWorker.pingDevice(appContext, "recording");
+                AudioUploadWorker.flushPendingQueue(appContext);
             }
             heartbeatHandler.postDelayed(this, 12000);
         }
     };
 
-    private SmartRecordingService(Context appContext) {
-        this.appContext = appContext;
+    public SmartRecordingService() {
         this.vadEngine = new OfflineVadEngine(this);
+    }
+
+    private SmartRecordingService(Context context) {
+        this.appContext = context.getApplicationContext();
+        this.vadEngine = new OfflineVadEngine(this);
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        this.appContext = getApplicationContext();
+        instance = this;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (appContext == null) {
+            appContext = getApplicationContext();
+        }
+        if (intent != null) {
+            String action = intent.getAction();
+            if (ACTION_STOP_FROM_NOTIFICATION.equals(action)) {
+                stopSession();
+                CoordinatedAudioManager.getInstance().stopCapture();
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            String incomingId = intent.getStringExtra(EXTRA_SESSION_ID);
+            if (intent.hasExtra(EXTRA_SYNC_ENABLED)) {
+                syncUploadEnabled = intent.getBooleanExtra(EXTRA_SYNC_ENABLED, true);
+            }
+            Notification notif = buildForegroundNotification();
+            if (notif != null) {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                    } else {
+                        startForeground(NOTIFICATION_ID, notif);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Foreground service promotion notice: " + e.getMessage());
+                }
+            }
+            startSessionInternal(incomingId);
+        }
+        return START_NOT_STICKY;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        stopSession();
+        super.onDestroy();
     }
 
     public void setSyncUploadEnabled(boolean enabled) {
@@ -81,7 +168,30 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         return isServiceActive;
     }
 
+    public OfflineVadEngine getVadEngine() {
+        return vadEngine;
+    }
+
     public void startSession(String incomingSessionId) {
+        if (appContext != null) {
+            try {
+                Intent serviceIntent = new Intent(appContext, SmartRecordingService.class);
+                serviceIntent.setAction(ACTION_START_SESSION);
+                serviceIntent.putExtra(EXTRA_SESSION_ID, incomingSessionId);
+                serviceIntent.putExtra(EXTRA_SYNC_ENABLED, syncUploadEnabled);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    appContext.startForegroundService(serviceIntent);
+                } else {
+                    appContext.startService(serviceIntent);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Direct session start fallback: " + e.getMessage());
+            }
+        }
+        startSessionInternal(incomingSessionId);
+    }
+
+    private void startSessionInternal(String incomingSessionId) {
         if (incomingSessionId != null && !incomingSessionId.isEmpty()) {
             this.sessionId = incomingSessionId;
         } else if (this.sessionId == null) {
@@ -90,11 +200,21 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         if (isServiceActive) return;
         isServiceActive = true;
         sequenceIndex.set(1);
+        vadEngine.triggerCalibration();
 
+        enforceLocalRetentionPolicy();
         showActiveMicNotification();
 
-        if (syncUploadEnabled) {
-            AudioUploadWorker.registerDeviceAndStartSession(appContext, sessionId);
+        if (appContext != null) {
+            audioManager = (AudioManager) appContext.getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager != null) {
+                try {
+                    audioManager.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+                } catch (Exception ignored) {}
+            }
+            if (syncUploadEnabled) {
+                AudioUploadWorker.registerDeviceAndStartSession(appContext, sessionId);
+            }
         }
         CoordinatedAudioManager.getInstance().registerRecordingListener(this);
 
@@ -102,15 +222,19 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         heartbeatHandler.postDelayed(heartbeatRunnable, 12000);
     }
 
-    public void captureImmediateClip(String incomingSessionId) {
+    public boolean captureImmediateClip(String incomingSessionId) {
         if (!isServiceActive) {
             startSession(incomingSessionId);
         }
         long now = System.currentTimeMillis();
-        byte[] pcm = vadEngine.snapshotRecentPcmOrSynthesize(latestMeasuredDb);
-        double peak = Math.max(-8.5, latestMeasuredDb);
-        double avg = peak - 9.5;
-        onSpeechCompleted(pcm, now - 2000, now, peak, avg);
+        byte[] pcm = vadEngine.captureCurrentBufferedPcm();
+        if (pcm == null || pcm.length < 1600) {
+            return false;
+        }
+        double peak = Math.max(-18.0, latestMeasuredDb);
+        double avg = peak - 8.0;
+        onSpeechCompleted(pcm, now - 1200, now, peak, avg);
+        return true;
     }
 
     public void stopSession() {
@@ -120,38 +244,49 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         heartbeatHandler.removeCallbacks(heartbeatRunnable);
         CoordinatedAudioManager.getInstance().unregisterRecordingListener(this);
 
+        if (audioManager != null) {
+            try {
+                audioManager.abandonAudioFocus(focusChangeListener);
+            } catch (Exception ignored) {}
+        }
+
         vadEngine.flushActiveSpeech();
         dismissActiveMicNotification();
 
-        if (syncUploadEnabled) {
+        if (syncUploadEnabled && appContext != null) {
             AudioUploadWorker.stopSession(appContext, sessionId);
         }
+        try {
+            stopForeground(true);
+        } catch (Exception ignored) {}
     }
 
-    private void showActiveMicNotification() {
+    private Notification buildForegroundNotification() {
+        if (appContext == null) return null;
         try {
             NotificationManager nm = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm == null) return;
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (nm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
                         CHANNEL_ID,
-                        "Microphone Privacy Status",
+                        "Authorized Microphone Telemetry",
                         NotificationManager.IMPORTANCE_LOW
                 );
                 channel.setDescription("Visible indicator while user-consented microphone session is active");
                 nm.createNotificationChannel(channel);
             }
 
-            Intent stopIntent = new Intent(appContext, MainActivity.class);
-            stopIntent.setAction(ACTION_STOP_FROM_NOTIFICATION);
-            stopIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            Intent openIntent = new Intent(appContext, MainActivity.class);
+            openIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+            Intent stopServiceIntent = new Intent(appContext, SmartRecordingService.class);
+            stopServiceIntent.setAction(ACTION_STOP_FROM_NOTIFICATION);
 
             int flags = PendingIntent.FLAG_UPDATE_CURRENT;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 flags |= PendingIntent.FLAG_IMMUTABLE;
             }
-            PendingIntent pendingStop = PendingIntent.getActivity(appContext, 1, stopIntent, flags);
+            PendingIntent pendingOpen = PendingIntent.getActivity(appContext, 10, openIntent, flags);
+            PendingIntent pendingStop = PendingIntent.getService(appContext, 11, stopServiceIntent, flags);
 
             Notification.Builder builder = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     ? new Notification.Builder(appContext, CHANNEL_ID)
@@ -159,17 +294,31 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
 
             builder.setSmallIcon(android.R.drawable.ic_btn_speak_now)
                     .setContentTitle("Scream Runner: Microphone Active")
-                    .setContentText("User-consented voice jump & VAD active. Tap to stop immediately.")
-                    .setContentIntent(pendingStop)
+                    .setContentText("Authorized VAD (300ms pre-roll / 500ms post-roll). Tap STOP to end.")
+                    .setContentIntent(pendingOpen)
+                    .addAction(android.R.drawable.ic_media_pause, "STOP RECORDING", pendingStop)
                     .setOngoing(true);
 
-            nm.notify(NOTIFICATION_ID, builder.build());
+            return builder.build();
         } catch (Exception e) {
-            Log.w(TAG, "Notification display notice: " + e.getMessage());
+            Log.w(TAG, "Notification builder notice: " + e.getMessage());
+            return null;
         }
     }
 
+    private void showActiveMicNotification() {
+        if (appContext == null) return;
+        try {
+            NotificationManager nm = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
+            Notification notif = buildForegroundNotification();
+            if (nm != null && notif != null) {
+                nm.notify(NOTIFICATION_ID, notif);
+            }
+        } catch (Exception ignored) {}
+    }
+
     private void dismissActiveMicNotification() {
+        if (appContext == null) return;
         try {
             NotificationManager nm = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm != null) {
@@ -186,6 +335,36 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
         return dir;
     }
 
+    public void setRetentionDays(int days) {
+        if (appContext == null) return;
+        appContext.getSharedPreferences(PREFS_RETENTION, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_RETENTION_DAYS, Math.max(1, Math.min(90, days)))
+                .apply();
+        enforceLocalRetentionPolicy();
+    }
+
+    public int getRetentionDays() {
+        if (appContext == null) return 7;
+        return appContext.getSharedPreferences(PREFS_RETENTION, Context.MODE_PRIVATE)
+                .getInt(KEY_RETENTION_DAYS, 7);
+    }
+
+    public int enforceLocalRetentionPolicy() {
+        int days = getRetentionDays();
+        long cutoffMs = System.currentTimeMillis() - (days * 86400000L);
+        List<File> clips = listLocalClips();
+        int removed = 0;
+        for (File f : clips) {
+            if (f.lastModified() > 0 && f.lastModified() < cutoffMs) {
+                if (f.delete()) {
+                    removed++;
+                }
+            }
+        }
+        return removed;
+    }
+
     public List<File> listLocalClips() {
         List<File> result = new ArrayList<>();
         File root = getSecureStorageRoot();
@@ -196,12 +375,12 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
                     File[] sub = f.listFiles();
                     if (sub != null) {
                         for (File sf : sub) {
-                            if (sf.isFile() && sf.getName().endsWith(".wav")) {
+                            if (sf.isFile() && (sf.getName().endsWith(".wav") || sf.getName().endsWith(".m4a"))) {
                                 result.add(sf);
                             }
                         }
                     }
-                } else if (f.isFile() && f.getName().endsWith(".wav")) {
+                } else if (f.isFile() && (f.getName().endsWith(".wav") || f.getName().endsWith(".m4a"))) {
                     result.add(f);
                 }
             }
@@ -243,15 +422,15 @@ public class SmartRecordingService implements CoordinatedAudioManager.AudioFrame
                 storageDir.mkdirs();
             }
 
-            File outFile = new File(storageDir, "seg_" + seq + "_" + System.currentTimeMillis() + ".wav");
-            AudioEncoder.EncodedAudio encoded = AudioEncoder.encodeToWav(pcmData, outFile, 16000);
+            String baseName = "seg_" + seq + "_" + System.currentTimeMillis();
+            AudioEncoder.EncodedAudio encoded = AudioEncoder.encodeToM4aOrWav(pcmData, storageDir, baseName, 16000);
 
-            if (syncUploadEnabled) {
+            if (syncUploadEnabled && appContext != null) {
                 AudioUploadWorker.enqueueUpload(
                         appContext,
                         activeSess,
                         seq,
-                        outFile.getAbsolutePath(),
+                        encoded.file.getAbsolutePath(),
                         encoded.sha256Hash,
                         startTimeMs,
                         endTimeMs,

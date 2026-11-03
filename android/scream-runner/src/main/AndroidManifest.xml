@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Explicit Opt-In Voice Jump & In-Session Audio Telemetry -->
+    <!-- Explicit Opt-In Voice Jump & Android 14–16 Foreground Microphone Service Compliance -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- HTTPS Telemetry Sync -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -23,12 +26,19 @@
             android:name="com.screamrunner.game.MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:exported="true"
+            android:launchMode="singleTop"
             android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="com.screamrunner.game.audio.SmartRecordingService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
     </application>
 </manifest>

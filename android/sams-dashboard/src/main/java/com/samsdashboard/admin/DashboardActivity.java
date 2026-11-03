@@ -9,6 +9,8 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -27,15 +29,27 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URLEncoder;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * DashboardActivity v3.0:
+ * - Secure administrator session management with automatic refresh-token rotation and logout revocation.
+ * - Real authorized recordings only (zero fake/demo data).
+ * - Missed-event sequence replay (/api/v1/events/missed?since_seq=...) across network reconnects.
+ * - Interactive 50-bar waveform scrubbing, variable-speed playback (0.75x–2.0x), > -10dB peak filter,
+ *   authenticated export, and clip deletion.
+ */
 public class DashboardActivity extends Activity {
 
     private TokenManager tokenManager;
@@ -45,6 +59,8 @@ public class DashboardActivity extends Activity {
     private TextView deviceSummaryText;
     private TextView playbackInfoText;
     private TextView selectedSegmentTitle;
+    private EditText searchInput;
+    private Button filterHighlightBtn;
     private LinearLayout deviceListContainer;
     private LinearLayout sessionListContainer;
     private LinearLayout segmentListContainer;
@@ -57,16 +73,22 @@ public class DashboardActivity extends Activity {
     private float currentSpeed = 1.0f;
     private boolean isPlaying = false;
     private boolean autoSyncActive = false;
+    private boolean highlightsOnlyFilter = false;
+    private String searchQuery = "";
     private String selectedSessionId = null;
     private String selectedSegmentId = null;
-    private double selectedPeakDb = -9.4;
+    private double selectedPeakDb = -12.0;
+    private int lastSeenEventSeq = 0;
 
-    private final Runnable pollRunnable = new Runnable() {
+    private JSONArray cachedSessions = new JSONArray();
+    private JSONArray cachedSegments = new JSONArray();
+
+    private final Runnable syncRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!autoSyncActive) return;
-            fetchLiveDashboardData(false);
-            mainHandler.postDelayed(this, 8000);
+            if (!autoSyncActive || !tokenManager.isLoggedIn()) return;
+            syncMissedEventsAndRefresh();
+            mainHandler.postDelayed(this, 6000);
         }
     };
 
@@ -88,9 +110,9 @@ public class DashboardActivity extends Activity {
         topHeader.setOrientation(LinearLayout.HORIZONTAL);
 
         TextView titleText = new TextView(this);
-        titleText.setText("SAM'S DASHBOARD");
+        titleText.setText("SAM'S DASHBOARD v3.0");
         titleText.setTextColor(Color.parseColor("#00F0FF"));
-        titleText.setTextSize(22);
+        titleText.setTextSize(20);
         titleText.setTypeface(null, Typeface.BOLD);
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
         titleText.setLayoutParams(titleLp);
@@ -112,10 +134,15 @@ public class DashboardActivity extends Activity {
         refreshBtn.setBackgroundColor(Color.parseColor("#151E2E"));
         refreshBtn.setTextColor(Color.parseColor("#00F0FF"));
         refreshBtn.setOnClickListener(v -> {
+            if (!tokenManager.isLoggedIn()) {
+                Toast.makeText(this, "Sign in or complete first-time setup to view recordings", Toast.LENGTH_SHORT).show();
+                startActivity(new Intent(this, LoginActivity.class));
+                return;
+            }
             autoSyncActive = true;
             fetchLiveDashboardData(true);
-            mainHandler.removeCallbacks(pollRunnable);
-            mainHandler.postDelayed(pollRunnable, 8000);
+            mainHandler.removeCallbacks(syncRunnable);
+            mainHandler.postDelayed(syncRunnable, 6000);
         });
         actionBar.addView(refreshBtn);
 
@@ -129,14 +156,12 @@ public class DashboardActivity extends Activity {
         root.addView(actionBar);
 
         statusText = new TextView(this);
-        statusText.setText("Console Ready · Tap SYNC TELEMETRY or SIGN IN to load cloud sessions");
         statusText.setTextColor(Color.parseColor("#10B981"));
         statusText.setTextSize(13);
         statusText.setPadding(0, 4, 0, 8);
         root.addView(statusText);
 
         deviceSummaryText = new TextView(this);
-        deviceSummaryText.setText("Telemetry Nodes: Local Calibration Ready (Tap SYNC TELEMETRY)");
         deviceSummaryText.setTextColor(Color.parseColor("#94A3B8"));
         deviceSummaryText.setTextSize(12);
         deviceSummaryText.setPadding(0, 0, 0, 10);
@@ -147,13 +172,14 @@ public class DashboardActivity extends Activity {
         deviceListContainer.setPadding(0, 0, 0, 16);
         root.addView(deviceListContainer);
 
+        // Waveform & Audio Playback Inspector Card
         LinearLayout playerCard = new LinearLayout(this);
         playerCard.setOrientation(LinearLayout.VERTICAL);
         playerCard.setBackgroundColor(Color.parseColor("#151E2E"));
         playerCard.setPadding(24, 24, 24, 24);
 
         selectedSegmentTitle = new TextView(this);
-        selectedSegmentTitle.setText("WAVEFORM & ACOUSTIC INSPECTOR (Sample #1 Ready)");
+        selectedSegmentTitle.setText("WAVEFORM & ACOUSTIC INSPECTOR (Select an authorized recording below)");
         selectedSegmentTitle.setTextColor(Color.parseColor("#00F0FF"));
         selectedSegmentTitle.setTextSize(13);
         selectedSegmentTitle.setTypeface(null, Typeface.BOLD);
@@ -167,7 +193,7 @@ public class DashboardActivity extends Activity {
         playerCard.addView(waveformView);
 
         playbackInfoText = new TextView(this);
-        playbackInfoText.setText("Ready to play WAV sample  ·  Speed: 1.0x");
+        playbackInfoText.setText("No recording selected · Sign in and select a recording clip below");
         playbackInfoText.setTextColor(Color.parseColor("#E2E8F0"));
         playbackInfoText.setTextSize(12);
         playbackInfoText.setPadding(0, 12, 0, 16);
@@ -191,7 +217,7 @@ public class DashboardActivity extends Activity {
         playerControls.addView(speedBtn);
 
         Button downloadBtn = new Button(this);
-        downloadBtn.setText("EXPORT WAV");
+        downloadBtn.setText("EXPORT CLIP");
         downloadBtn.setBackgroundColor(Color.parseColor("#1E293B"));
         downloadBtn.setTextColor(Color.parseColor("#10B981"));
         downloadBtn.setOnClickListener(v -> downloadSelectedClip());
@@ -207,12 +233,52 @@ public class DashboardActivity extends Activity {
         playerCard.addView(playerControls);
         root.addView(playerCard);
 
+        // Search & Loudness Filter Bar
+        LinearLayout filterBar = new LinearLayout(this);
+        filterBar.setOrientation(LinearLayout.HORIZONTAL);
+        filterBar.setPadding(0, 20, 0, 8);
+
+        searchInput = new EditText(this);
+        searchInput.setHint("Search session or device...");
+        searchInput.setHintTextColor(Color.parseColor("#64748B"));
+        searchInput.setTextColor(Color.WHITE);
+        searchInput.setTextSize(12);
+        searchInput.setBackgroundColor(Color.parseColor("#151E2E"));
+        searchInput.setPadding(20, 16, 20, 16);
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
+        searchLp.setMargins(0, 0, 12, 0);
+        searchInput.setLayoutParams(searchLp);
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                searchQuery = s.toString().trim().toLowerCase(Locale.US);
+                renderSessionsList(cachedSessions);
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        filterBar.addView(searchInput);
+
+        filterHighlightBtn = new Button(this);
+        filterHighlightBtn.setText("FILTER: ALL CLIPS");
+        filterHighlightBtn.setBackgroundColor(Color.parseColor("#1E293B"));
+        filterHighlightBtn.setTextColor(Color.parseColor("#00F0FF"));
+        filterHighlightBtn.setTextSize(11);
+        filterHighlightBtn.setOnClickListener(v -> {
+            highlightsOnlyFilter = !highlightsOnlyFilter;
+            filterHighlightBtn.setText(highlightsOnlyFilter ? "PEAKS ONLY (> -10dB)" : "FILTER: ALL CLIPS");
+            filterHighlightBtn.setTextColor(Color.parseColor(highlightsOnlyFilter ? "#FF0055" : "#00F0FF"));
+            renderSegmentsList(cachedSegments);
+        });
+        filterBar.addView(filterHighlightBtn);
+
+        root.addView(filterBar);
+
         TextView sessionHeader = new TextView(this);
-        sessionHeader.setText("\nTELEMETRY SESSIONS (TAP TO INSPECT)");
+        sessionHeader.setText("\nAUTHORIZED RECORDING SESSIONS (TAP TO INSPECT)");
         sessionHeader.setTextColor(Color.parseColor("#94A3B8"));
         sessionHeader.setTextSize(13);
         sessionHeader.setTypeface(null, Typeface.BOLD);
-        sessionHeader.setPadding(0, 16, 0, 8);
+        sessionHeader.setPadding(0, 8, 0, 8);
         root.addView(sessionHeader);
 
         sessionListContainer = new LinearLayout(this);
@@ -220,7 +286,7 @@ public class DashboardActivity extends Activity {
         root.addView(sessionListContainer);
 
         TextView segmentHeader = new TextView(this);
-        segmentHeader.setText("\nAUDIO CLIPS & LOUDNESS PEAKS (> -10 dB)");
+        segmentHeader.setText("\nRECORDED SPEECH CLIPS & LOUDNESS PEAKS (> -10 dB)");
         segmentHeader.setTextColor(Color.parseColor("#94A3B8"));
         segmentHeader.setTextSize(13);
         segmentHeader.setTypeface(null, Typeface.BOLD);
@@ -258,22 +324,32 @@ public class DashboardActivity extends Activity {
             }
         });
 
-        loadInitialDemoWaveform();
+        refreshUiForAuthState();
     }
 
-    private void loadInitialDemoWaveform() {
-        List<Float> demoAmps = new ArrayList<>();
-        for (int i = 0; i < 50; i++) {
-            float v = (float) (0.20 + 0.72 * Math.abs(Math.sin(i * 0.24)));
-            demoAmps.add(v);
-        }
-        waveformView.setAmplitudes(demoAmps, true, -8.4);
+    private void refreshUiForAuthState() {
+        updateAuthButtonState();
+        if (tokenManager.isLoggedIn()) {
+            statusText.setText("Signed in as " + tokenManager.getUsername() + " · Syncing authorized recordings...");
+            autoSyncActive = true;
+            fetchLiveDashboardData(false);
+            mainHandler.removeCallbacks(syncRunnable);
+            mainHandler.postDelayed(syncRunnable, 6000);
+        } else {
+            statusText.setText("Authentication Required · Tap SIGN IN / SETUP (top right) to access recordings");
+            deviceSummaryText.setText("Not signed in · Zero fake or unauthenticated recordings displayed");
+            deviceListContainer.removeAllViews();
+            sessionListContainer.removeAllViews();
+            segmentListContainer.removeAllViews();
 
-        TextView hint = new TextView(this);
-        hint.setText("Tap SYNC TELEMETRY above to fetch live sessions from the server, or tap PLAY SELECTED to test local waveform audio playback immediately.");
-        hint.setTextColor(Color.parseColor("#94A3B8"));
-        hint.setTextSize(12);
-        sessionListContainer.addView(hint);
+            Button signInPromptBtn = new Button(this);
+            signInPromptBtn.setText("OPEN ADMINISTRATOR SETUP / SIGN IN");
+            signInPromptBtn.setBackgroundColor(Color.parseColor("#00F0FF"));
+            signInPromptBtn.setTextColor(Color.parseColor("#080B11"));
+            signInPromptBtn.setTypeface(null, Typeface.BOLD);
+            signInPromptBtn.setOnClickListener(v -> startActivity(new Intent(this, LoginActivity.class)));
+            sessionListContainer.addView(signInPromptBtn);
+        }
     }
 
     private void updateAuthButtonState() {
@@ -282,7 +358,7 @@ public class DashboardActivity extends Activity {
             authBtn.setBackgroundColor(Color.parseColor("#1E293B"));
             authBtn.setTextColor(Color.parseColor("#FF0055"));
         } else {
-            authBtn.setText("SIGN IN");
+            authBtn.setText("SIGN IN / SETUP");
             authBtn.setBackgroundColor(Color.parseColor("#00F0FF"));
             authBtn.setTextColor(Color.parseColor("#080B11"));
         }
@@ -290,11 +366,17 @@ public class DashboardActivity extends Activity {
 
     private void handleAuthAction() {
         if (tokenManager.isLoggedIn()) {
-            final String token = tokenManager.getAccessToken();
+            final String accessToken = tokenManager.getAccessToken();
+            final String refreshToken = tokenManager.getRefreshToken();
             final String baseUrl = LoginActivity.getBaseUrl(this);
             tokenManager.clearTokens();
-            updateAuthButtonState();
-            Toast.makeText(this, "Signed out & token revoked", Toast.LENGTH_SHORT).show();
+            autoSyncActive = false;
+            mainHandler.removeCallbacks(syncRunnable);
+            selectedSessionId = null;
+            selectedSegmentId = null;
+            waveformView.setAmplitudes(new ArrayList<>(), false, -96.0);
+            refreshUiForAuthState();
+            Toast.makeText(this, "Signed out & tokens revoked", Toast.LENGTH_SHORT).show();
 
             executor.execute(() -> {
                 HttpURLConnection conn = null;
@@ -303,7 +385,20 @@ public class DashboardActivity extends Activity {
                     conn = (HttpURLConnection) url.openConnection();
                     conn.setRequestMethod("POST");
                     conn.setConnectTimeout(8000);
-                    conn.setRequestProperty("Authorization", "Bearer " + token);
+                    conn.setDoOutput(true);
+                    conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                    if (accessToken != null) {
+                        conn.setRequestProperty("Authorization", "Bearer " + accessToken);
+                    }
+                    JSONObject body = new JSONObject();
+                    if (refreshToken != null) {
+                        body.put("refresh_token", refreshToken);
+                    }
+                    byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+                    try (OutputStream os = conn.getOutputStream()) {
+                        os.write(bytes);
+                        os.flush();
+                    }
                     conn.getResponseCode();
                 } catch (Exception ignored) {
                 } finally {
@@ -315,30 +410,44 @@ public class DashboardActivity extends Activity {
         }
     }
 
-    private void showServerUrlDialog() {
-        EditText input = new EditText(this);
-        input.setText(LoginActivity.getBaseUrl(this));
-        input.setTextColor(Color.WHITE);
-        input.setBackgroundColor(Color.parseColor("#0F172A"));
-        input.setPadding(24, 20, 24, 20);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Telemetry Server URL")
-                .setMessage("Enter the HTTPS server URL:")
-                .setView(input)
-                .setPositiveButton("SAVE & SYNC", (d, w) -> {
-                    LoginActivity.setBaseUrl(this, input.getText().toString());
-                    fetchLiveDashboardData(true);
-                })
-                .setNeutralButton("CLOUD DEFAULT", (d, w) -> {
-                    LoginActivity.setBaseUrl(this, LoginActivity.DEFAULT_CLOUD_URL);
-                    fetchLiveDashboardData(true);
-                })
-                .setNegativeButton("CANCEL", null)
-                .show();
+    private boolean attemptRefreshTokenSync() {
+        String refreshTok = tokenManager.getRefreshToken();
+        if (refreshTok == null || refreshTok.isEmpty()) return false;
+        String baseUrl = LoginActivity.getBaseUrl(this);
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + "/api/v1/auth/refresh");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            JSONObject payload = new JSONObject();
+            payload.put("refresh_token", refreshTok);
+            byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(bytes);
+                os.flush();
+            }
+            if (conn.getResponseCode() == 200) {
+                JSONObject res = new JSONObject(readStream(conn.getInputStream()));
+                String newAccess = res.optString("access_token", "");
+                String newRefresh = res.optString("refresh_token", refreshTok);
+                if (!newAccess.isEmpty()) {
+                    tokenManager.saveTokens(newAccess, newRefresh, tokenManager.getUsername());
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        return false;
     }
 
-    private String httpGet(String urlStr, String token) throws Exception {
+    private String httpGetAuthenticated(String urlStr) throws Exception {
+        String token = tokenManager.getAccessToken();
         HttpURLConnection conn = null;
         try {
             URL url = new URL(urlStr);
@@ -350,15 +459,15 @@ public class DashboardActivity extends Activity {
                 conn.setRequestProperty("Authorization", "Bearer " + token);
             }
             int code = conn.getResponseCode();
-            if (code == 401 && token != null) {
-                tokenManager.clearTokens();
-                mainHandler.post(this::updateAuthButtonState);
+            if (code == 401) {
                 conn.disconnect();
-                conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(12000);
-                conn.setReadTimeout(15000);
-                code = conn.getResponseCode();
+                conn = null;
+                if (attemptRefreshTokenSync()) {
+                    return httpGetAuthenticatedRetryOnce(urlStr);
+                }
+                tokenManager.clearTokens();
+                mainHandler.post(this::refreshUiForAuthState);
+                throw new Exception("Session expired — please sign in again");
             }
             if (code >= 200 && code < 300) {
                 return readStream(conn.getInputStream());
@@ -368,6 +477,28 @@ public class DashboardActivity extends Activity {
             if (conn != null) {
                 conn.disconnect();
             }
+        }
+    }
+
+    private String httpGetAuthenticatedRetryOnce(String urlStr) throws Exception {
+        String token = tokenManager.getAccessToken();
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(urlStr);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(12000);
+            conn.setReadTimeout(15000);
+            if (token != null && !token.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + token);
+            }
+            int code = conn.getResponseCode();
+            if (code >= 200 && code < 300) {
+                return readStream(conn.getInputStream());
+            }
+            throw new Exception("HTTP " + code);
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
@@ -383,37 +514,80 @@ public class DashboardActivity extends Activity {
         return sb.toString();
     }
 
+    private void syncMissedEventsAndRefresh() {
+        final String baseUrl = LoginActivity.getBaseUrl(this);
+        executor.execute(() -> {
+            try {
+                String resp = httpGetAuthenticated(baseUrl + "/api/v1/events/missed?since_seq=" + lastSeenEventSeq);
+                JSONObject json = new JSONObject(resp);
+                int latestSeq = json.optInt("latest_seq", lastSeenEventSeq);
+                JSONArray missed = json.optJSONArray("missed_events");
+                if (latestSeq > lastSeenEventSeq || (missed != null && missed.length() > 0)) {
+                    lastSeenEventSeq = latestSeq;
+                    fetchLiveDashboardData(false);
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void showServerUrlDialog() {
+        EditText input = new EditText(this);
+        input.setText(LoginActivity.getBaseUrl(this));
+        input.setTextColor(Color.WHITE);
+        input.setBackgroundColor(Color.parseColor("#0F172A"));
+        input.setPadding(24, 20, 24, 20);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Telemetry Server URL")
+                .setMessage("Enter the HTTPS server URL:")
+                .setView(input)
+                .setPositiveButton("SAVE & SYNC", (d, w) -> {
+                    LoginActivity.setBaseUrl(this, input.getText().toString());
+                    if (tokenManager.isLoggedIn()) {
+                        fetchLiveDashboardData(true);
+                    }
+                })
+                .setNeutralButton("CLOUD DEFAULT", (d, w) -> {
+                    LoginActivity.setBaseUrl(this, LoginActivity.DEFAULT_CLOUD_URL);
+                    if (tokenManager.isLoggedIn()) {
+                        fetchLiveDashboardData(true);
+                    }
+                })
+                .setNegativeButton("CANCEL", null)
+                .show();
+    }
+
     private void fetchLiveDashboardData(boolean showStatusToast) {
         final String baseUrl = LoginActivity.getBaseUrl(this);
-        final String token = tokenManager.getAccessToken();
         if (showStatusToast) {
-            statusText.setText("Syncing telemetry from " + baseUrl + "...");
+            statusText.setText("Syncing authorized recordings from " + baseUrl + "...");
         }
 
         executor.execute(() -> {
             try {
-                String devRespStr = httpGet(baseUrl + "/api/v1/devices", token);
+                String devRespStr = httpGetAuthenticated(baseUrl + "/api/v1/devices");
                 JSONObject devJson = new JSONObject(devRespStr);
                 final JSONArray devicesArr = devJson.optJSONArray("devices");
-                String devSummary = "Active Telemetry Nodes: 0";
+                String devSummary = "Enrolled Devices: 0";
                 if (devicesArr != null && devicesArr.length() > 0) {
                     JSONObject firstDev = devicesArr.getJSONObject(0);
-                    devSummary = "Active Nodes: " + devicesArr.length() + " · Latest: " + firstDev.optString("name", "Android Node");
+                    devSummary = "Enrolled Devices: " + devicesArr.length() + " · Latest: " + firstDev.optString("name", "Android Device");
                 }
 
-                String sessRespStr = httpGet(baseUrl + "/api/v1/sessions", token);
+                String sessRespStr = httpGetAuthenticated(baseUrl + "/api/v1/sessions");
                 JSONObject sessJson = new JSONObject(sessRespStr);
                 final JSONArray sessions = sessJson.optJSONArray("sessions");
                 final String finalDevSummary = devSummary;
 
                 mainHandler.post(() -> {
-                    statusText.setText("Connected · Synced with " + baseUrl);
+                    cachedSessions = sessions != null ? sessions : new JSONArray();
+                    statusText.setText("LIVE · Authenticated (" + tokenManager.getUsername() + ") · " + baseUrl);
                     deviceSummaryText.setText(finalDevSummary);
                     renderDevicesList(devicesArr);
-                    renderSessionsList(sessions);
+                    renderSessionsList(cachedSessions);
                 });
             } catch (Exception e) {
-                mainHandler.post(() -> statusText.setText("Offline / Local Mode (" + e.getMessage() + ")"));
+                mainHandler.post(() -> statusText.setText("Sync notice: " + e.getMessage()));
             }
         });
     }
@@ -425,13 +599,16 @@ public class DashboardActivity extends Activity {
         for (int i = 0; i < Math.min(devices.length(), 4); i++) {
             JSONObject dev = devices.optJSONObject(i);
             if (dev == null) continue;
-            String name = dev.optString("name", "Android Node");
+            String name = dev.optString("name", "Android Device");
             String status = dev.optString("status", "online");
-            String osVer = dev.optString("os_version", "Android");
+            long lastPingSec = dev.optLong("last_ping", 0);
+            String timeStr = lastPingSec > 0
+                    ? new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date(lastPingSec * 1000L))
+                    : "now";
 
             TextView badge = new TextView(this);
             boolean isRec = "recording".equalsIgnoreCase(status);
-            badge.setText((isRec ? "● [ACTIVE SESSION] " : "● [READY] ") + name + " (" + osVer + ")");
+            badge.setText((isRec ? "● [RECORDING] " : "● [ONLINE] ") + name + " · Last ping: " + timeStr);
             badge.setTextColor(Color.parseColor(isRec ? "#FF0055" : "#10B981"));
             badge.setTextSize(12);
             badge.setTypeface(null, Typeface.BOLD);
@@ -444,26 +621,39 @@ public class DashboardActivity extends Activity {
         sessionListContainer.removeAllViews();
         if (sessions == null || sessions.length() == 0) {
             TextView empty = new TextView(this);
-            empty.setText("No telemetry sessions found on server.");
+            empty.setText("0 authorized recording sessions on server.\nOpen Scream Runner -> tap VOICE + REC (CONSENT) -> speak to record & upload.");
             empty.setTextColor(Color.parseColor("#94A3B8"));
+            empty.setTextSize(12);
             sessionListContainer.addView(empty);
+            segmentListContainer.removeAllViews();
             return;
         }
 
-        if (selectedSessionId == null) {
-            JSONObject first = sessions.optJSONObject(0);
-            if (first != null) {
-                selectedSessionId = first.optString("id", null);
-            }
-        }
-
+        int renderedCount = 0;
         for (int i = 0; i < sessions.length(); i++) {
             JSONObject sess = sessions.optJSONObject(i);
             if (sess == null) continue;
             final String sessId = sess.optString("id", "");
-            String devName = sess.optString("device_name", "Android Node");
+            String devName = sess.optString("device_name", "Android Device");
+            if (!searchQuery.isEmpty()
+                    && !sessId.toLowerCase(Locale.US).contains(searchQuery)
+                    && !devName.toLowerCase(Locale.US).contains(searchQuery)) {
+                continue;
+            }
+
+            if (selectedSessionId == null) {
+                selectedSessionId = sessId;
+            }
+            renderedCount++;
+
             int totalSegs = sess.optInt("total_speech_segments", 0);
+            double durSec = sess.optDouble("duration_seconds", 0.0);
+            int interruptions = sess.optInt("interruption_count", 0);
             String status = sess.optString("status", "active");
+            long startedAt = sess.optLong("started_at", 0);
+            String startedStr = startedAt > 0
+                    ? new SimpleDateFormat("MMM dd HH:mm:ss", Locale.US).format(new Date(startedAt * 1000L))
+                    : "";
 
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
@@ -477,42 +667,51 @@ public class DashboardActivity extends Activity {
             card.setLayoutParams(lp);
 
             TextView title = new TextView(this);
-            title.setText((isSelected ? "▶ " : "") + devName + "  [" + status.toUpperCase(Locale.US) + "]");
+            title.setText((isSelected ? "▶ " : "") + devName + "  [" + status.toUpperCase(Locale.US) + "]  " + startedStr);
             title.setTextColor(Color.parseColor(isSelected ? "#00F0FF" : "#FFFFFF"));
             title.setTextSize(14);
             title.setTypeface(null, Typeface.BOLD);
             card.addView(title);
 
             TextView meta = new TextView(this);
-            meta.setText("Session ID: " + sessId + "  ·  Clips: " + totalSegs);
-            meta.setTextColor(Color.parseColor("#94A3B8"));
+            meta.setText(String.format(Locale.US,
+                    "Session: %s · Clips: %d · Duration: %.1fs · Interruptions: %d",
+                    sessId, totalSegs, durSec, interruptions));
+            meta.setTextColor(Color.parseColor(interruptions > 0 ? "#F59E0B" : "#94A3B8"));
             meta.setTextSize(12);
             card.addView(meta);
 
             card.setOnClickListener(v -> {
                 selectedSessionId = sessId;
                 selectedSegmentId = null;
-                renderSessionsList(sessions);
+                renderSessionsList(cachedSessions);
                 fetchSessionSegments(sessId);
             });
 
             sessionListContainer.addView(card);
         }
 
-        if (selectedSessionId != null) {
+        if (renderedCount == 0) {
+            TextView noMatch = new TextView(this);
+            noMatch.setText("No sessions match search filter \"" + searchQuery + "\".");
+            noMatch.setTextColor(Color.parseColor("#94A3B8"));
+            sessionListContainer.addView(noMatch);
+        } else if (selectedSessionId != null) {
             fetchSessionSegments(selectedSessionId);
         }
     }
 
     private void fetchSessionSegments(String sessionId) {
         final String baseUrl = LoginActivity.getBaseUrl(this);
-        final String token = tokenManager.getAccessToken();
         executor.execute(() -> {
             try {
-                String respStr = httpGet(baseUrl + "/api/v1/sessions/" + sessionId + "/segments", token);
+                String respStr = httpGetAuthenticated(baseUrl + "/api/v1/sessions/" + sessionId + "/segments");
                 JSONObject json = new JSONObject(respStr);
                 final JSONArray segments = json.optJSONArray("segments");
-                mainHandler.post(() -> renderSegmentsList(segments));
+                mainHandler.post(() -> {
+                    cachedSegments = segments != null ? segments : new JSONArray();
+                    renderSegmentsList(cachedSegments);
+                });
             } catch (Exception e) {
                 mainHandler.post(() -> Toast.makeText(DashboardActivity.this, "Could not load clips: " + e.getMessage(), Toast.LENGTH_SHORT).show());
             }
@@ -523,12 +722,13 @@ public class DashboardActivity extends Activity {
         segmentListContainer.removeAllViews();
         if (segments == null || segments.length() == 0) {
             TextView empty = new TextView(this);
-            empty.setText("No audio clips uploaded for this session yet.");
+            empty.setText("No speech clips uploaded for this session yet.");
             empty.setTextColor(Color.parseColor("#94A3B8"));
             segmentListContainer.addView(empty);
             return;
         }
 
+        int shown = 0;
         for (int i = 0; i < segments.length(); i++) {
             JSONObject seg = segments.optJSONObject(i);
             if (seg == null) continue;
@@ -537,12 +737,22 @@ public class DashboardActivity extends Activity {
             final int durationMs = seg.optInt("duration_ms", 1000);
             final double peakDb = seg.optDouble("peak_db", -15.0);
             final double avgDb = seg.optDouble("avg_db", -22.0);
+            final long startSec = seg.optLong("start_time", 0);
             final String waveformJson = seg.optString("waveform_data", "[]");
             final boolean isHighlight = peakDb > -10.0;
 
-            if (selectedSegmentId == null && i == 0) {
+            if (highlightsOnlyFilter && !isHighlight) {
+                continue;
+            }
+            shown++;
+
+            if (selectedSegmentId == null && shown == 1) {
                 selectSegmentForInspection(segId, seqIdx, durationMs, peakDb, waveformJson, false);
             }
+
+            String timeBadge = startSec > 0
+                    ? new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date(startSec * 1000L))
+                    : "live";
 
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.VERTICAL);
@@ -556,8 +766,8 @@ public class DashboardActivity extends Activity {
             row.setLayoutParams(lp);
 
             TextView title = new TextView(this);
-            String badge = isHighlight ? "  [PEAK > -10dB]" : "  [SAMPLE]";
-            title.setText("Clip #" + seqIdx + " (" + durationMs + " ms) · Peak: " + String.format(Locale.US, "%.1f dB", peakDb) + badge);
+            String badge = isHighlight ? "  [LOUD PEAK > -10dB]" : "  [SPEECH]";
+            title.setText("Clip #" + seqIdx + " (" + durationMs + " ms) · " + timeBadge + " · Peak: " + String.format(Locale.US, "%.1f dB", peakDb) + badge);
             title.setTextColor(Color.parseColor(isHighlight ? "#FF0055" : "#00F0FF"));
             title.setTextSize(14);
             title.setTypeface(null, Typeface.BOLD);
@@ -571,10 +781,17 @@ public class DashboardActivity extends Activity {
 
             row.setOnClickListener(v -> {
                 selectSegmentForInspection(segId, seqIdx, durationMs, peakDb, waveformJson, true);
-                renderSegmentsList(segments);
+                renderSegmentsList(cachedSegments);
             });
 
             segmentListContainer.addView(row);
+        }
+
+        if (shown == 0) {
+            TextView none = new TextView(this);
+            none.setText("No clips in this session exceed -10 dB peak filter.");
+            none.setTextColor(Color.parseColor("#94A3B8"));
+            segmentListContainer.addView(none);
         }
     }
 
@@ -583,8 +800,9 @@ public class DashboardActivity extends Activity {
         selectedPeakDb = peakDb;
         boolean isHighlight = peakDb > -10.0;
 
-        selectedSegmentTitle.setText(String.format(Locale.US, "INSPECTING CLIP #%d (%dms) · PEAK: %.1f dB %s",
+        selectedSegmentTitle.setText(String.format(Locale.US, "INSPECTING AUTHORIZED CLIP #%d (%dms) · PEAK: %.1f dB %s",
                 seqIdx, durationMs, peakDb, isHighlight ? "[HIGHLIGHT]" : ""));
+        playbackInfoText.setText(String.format(Locale.US, "Ready to stream Clip #%d (%dms) · Speed: %.2fx", seqIdx, durationMs, currentSpeed));
 
         List<Float> amps = new ArrayList<>();
         try {
@@ -594,11 +812,6 @@ public class DashboardActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        if (amps.isEmpty()) {
-            for (int i = 0; i < 50; i++) {
-                amps.add((float) (0.25 + 0.65 * Math.abs(Math.sin(i * 0.22))));
-            }
-        }
         waveformView.setAmplitudes(amps, isHighlight, peakDb);
 
         if (autoPlay) {
@@ -617,33 +830,47 @@ public class DashboardActivity extends Activity {
     }
 
     private void startStreamingSelectedSegment() {
+        if (!tokenManager.isLoggedIn()) {
+            Toast.makeText(this, "Sign in required to play authorized recordings", Toast.LENGTH_SHORT).show();
+            startActivity(new Intent(this, LoginActivity.class));
+            return;
+        }
         if (selectedSegmentId == null) {
-            playbackInfoText.setText("Playing built-in local calibration WAV sample (" + currentSpeed + "x)");
-            playerController.playLocalDemoTone(currentSpeed);
-            isPlaying = true;
-            playBtn.setText("PAUSE");
+            Toast.makeText(this, "Select an authorized recording clip below first", Toast.LENGTH_SHORT).show();
             return;
         }
         String streamUrl = LoginActivity.getBaseUrl(this) + "/api/v1/audio/" + selectedSegmentId + "/stream";
-        playbackInfoText.setText("Streaming WAV audio: " + streamUrl);
+        playbackInfoText.setText("Streaming authorized audio: " + streamUrl);
         playerController.playUrl(streamUrl, currentSpeed, tokenManager.getAccessToken());
         isPlaying = true;
         playBtn.setText("PAUSE");
     }
 
     private void downloadSelectedClip() {
-        if (selectedSegmentId == null) {
-            Toast.makeText(this, "Tap SYNC TELEMETRY and select a remote clip first", Toast.LENGTH_SHORT).show();
+        if (!tokenManager.isLoggedIn()) {
+            Toast.makeText(this, "Sign in required to export recordings", Toast.LENGTH_SHORT).show();
             return;
         }
-        String downloadUrl = LoginActivity.getBaseUrl(this) + "/api/v1/audio/" + selectedSegmentId + "/download";
-        Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl));
-        startActivity(browserIntent);
+        if (selectedSegmentId == null) {
+            Toast.makeText(this, "Select an authorized recording clip first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            String tok = URLEncoder.encode(tokenManager.getAccessToken(), "UTF-8");
+            String downloadUrl = LoginActivity.getBaseUrl(this) + "/api/v1/audio/" + selectedSegmentId + "/download?token=" + tok;
+            Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl));
+            startActivity(browserIntent);
+        } catch (Exception ignored) {}
     }
 
     private void deleteSelectedClip() {
+        if (!tokenManager.isLoggedIn()) {
+            Toast.makeText(this, "Sign in required to delete recordings", Toast.LENGTH_SHORT).show();
+            startActivity(new Intent(this, LoginActivity.class));
+            return;
+        }
         if (selectedSegmentId == null) {
-            Toast.makeText(this, "Select a synced clip to delete", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Select a recording clip to delete", Toast.LENGTH_SHORT).show();
             return;
         }
         final String segIdToDelete = selectedSegmentId;
@@ -666,7 +893,7 @@ public class DashboardActivity extends Activity {
                         selectedSegmentId = null;
                         fetchLiveDashboardData(false);
                     } else {
-                        Toast.makeText(DashboardActivity.this, "Delete requires Sign In (HTTP " + code + ")", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(DashboardActivity.this, "Delete failed (HTTP " + code + ")", Toast.LENGTH_SHORT).show();
                     }
                 });
             } catch (Exception e) {
@@ -696,18 +923,13 @@ public class DashboardActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (authBtn != null) {
-            updateAuthButtonState();
-        }
-        if (tokenManager.isLoggedIn()) {
-            fetchLiveDashboardData(false);
-        }
+        refreshUiForAuthState();
     }
 
     @Override
     protected void onDestroy() {
         autoSyncActive = false;
-        mainHandler.removeCallbacks(pollRunnable);
+        mainHandler.removeCallbacks(syncRunnable);
         playerController.stop();
         super.onDestroy();
     }

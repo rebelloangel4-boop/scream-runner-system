@@ -4,10 +4,11 @@ import java.io.ByteArrayOutputStream;
 import java.util.LinkedList;
 
 /**
- * OfflineVadEngine:
- * Real-time Voice Activity Detection utilizing adaptive energy thresholding
- * and Zero-Crossing Rate (ZCR).
- * Maintains a 300ms pre-speech circular buffer and a 500ms post-speech hangover buffer.
+ * OfflineVadEngine v3.0:
+ * Real-time Voice Activity Detection utilizing adaptive noise-floor calibration,
+ * hysteresis energy thresholding, and Zero-Crossing Rate (ZCR).
+ * Maintains an exact 300ms pre-roll circular buffer and 500ms post-roll hangover buffer
+ * so the initial consonant of spoken words is never clipped.
  */
 public class OfflineVadEngine {
 
@@ -17,19 +18,24 @@ public class OfflineVadEngine {
     }
 
     private static final int SAMPLE_RATE = 16000;
-    private static final int BYTES_PER_SAMPLE = 2; // 16-bit
+    private static final int BYTES_PER_SAMPLE = 2; // 16-bit PCM
     private static final int SAMPLES_PER_MS = SAMPLE_RATE / 1000;
 
-    private static final int PRE_SPEECH_SAMPLES = 300 * SAMPLES_PER_MS; // 300 ms = 4800 samples
-    private static final int POST_SPEECH_SAMPLES = 500 * SAMPLES_PER_MS; // 500 ms = 8000 samples
+    public static final int PRE_ROLL_MS = 300;
+    public static final int POST_ROLL_MS = 500;
+    private static final int PRE_SPEECH_SAMPLES = PRE_ROLL_MS * SAMPLES_PER_MS;   // 4,800 samples (300 ms)
+    private static final int POST_SPEECH_SAMPLES = POST_ROLL_MS * SAMPLES_PER_MS; // 8,000 samples (500 ms)
+    private static final int MAX_SEGMENT_SAMPLES = 15000 * SAMPLES_PER_MS;        // 15s max per segment
 
     private final VadCallback callback;
     private double noiseFloorDb = -48.0;
-    private double sensitivityOffsetDb = 9.0;
+    private double sensitivityOffsetDb = 8.5;
+    private int calibrationFramesRemaining = 20;
 
     private boolean isSpeaking = false;
     private long speechStartTimeMs = 0;
     private int silentSamplesCount = 0;
+    private int activeSamplesCount = 0;
     private double currentPeakDb = -96.0;
     private double dbSum = 0;
     private int dbCount = 0;
@@ -44,10 +50,16 @@ public class OfflineVadEngine {
     }
 
     public synchronized void setSensitivityOffsetDb(double offsetDb) {
-        this.sensitivityOffsetDb = offsetDb;
+        this.sensitivityOffsetDb = Math.max(4.0, Math.min(24.0, offsetDb));
+    }
+
+    public synchronized void triggerCalibration() {
+        calibrationFramesRemaining = 25;
     }
 
     public synchronized void processFrame(short[] buffer, int length, double measuredDb) {
+        if (length <= 0) return;
+
         int zcr = 0;
         for (int i = 1; i < length; i++) {
             if ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0)) {
@@ -56,27 +68,36 @@ public class OfflineVadEngine {
         }
         double zcrRate = (double) zcr / length;
 
-        if (!isSpeaking) {
-            if (measuredDb > -90.0 && measuredDb < noiseFloorDb + 3.0) {
-                noiseFloorDb = 0.95 * noiseFloorDb + 0.05 * measuredDb;
-            }
+        // Adaptive noise-floor calibration during initial frames or ambient silence
+        if (calibrationFramesRemaining > 0 && measuredDb > -90.0 && measuredDb < -20.0) {
+            noiseFloorDb = 0.75 * noiseFloorDb + 0.25 * measuredDb;
+            calibrationFramesRemaining--;
+        } else if (!isSpeaking && measuredDb > -90.0 && measuredDb < noiseFloorDb + 3.5) {
+            noiseFloorDb = 0.96 * noiseFloorDb + 0.04 * measuredDb;
         }
+        noiseFloorDb = Math.max(-68.0, Math.min(-28.0, noiseFloorDb));
 
-        double triggerThreshold = noiseFloorDb + sensitivityOffsetDb;
-        boolean frameIsSpeech = (measuredDb > triggerThreshold) && (zcrRate > 0.02 && zcrRate < 0.60);
+        double onsetThreshold = noiseFloorDb + sensitivityOffsetDb;
+        double sustainThreshold = onsetThreshold - 3.0; // Hysteresis prevents mid-word dropouts
+        double activeThreshold = isSpeaking ? sustainThreshold : onsetThreshold;
+
+        boolean frameIsSpeech = (measuredDb > activeThreshold) && (zcrRate > 0.015 && zcrRate < 0.65);
 
         if (frameIsSpeech) {
             silentSamplesCount = 0;
             if (!isSpeaking) {
                 isSpeaking = true;
-                speechStartTimeMs = System.currentTimeMillis() - 300;
+                speechStartTimeMs = System.currentTimeMillis() - PRE_ROLL_MS;
                 currentPeakDb = measuredDb;
                 dbSum = measuredDb;
                 dbCount = 1;
+                activeSamplesCount = 0;
 
                 activeSpeechStream.reset();
+                // Prepend 300ms pre-roll ring buffer so initial consonant is never clipped
                 for (short[] preBuf : preSpeechRingBuffer) {
                     appendShortsToStream(preBuf, preBuf.length);
+                    activeSamplesCount += preBuf.length;
                 }
                 preSpeechRingBuffer.clear();
                 ringBufferSampleCount = 0;
@@ -93,12 +114,19 @@ public class OfflineVadEngine {
             }
 
             appendShortsToStream(buffer, length);
+            activeSamplesCount += length;
+
+            if (activeSamplesCount >= MAX_SEGMENT_SAMPLES) {
+                flushActiveSpeech();
+            }
 
         } else {
             if (isSpeaking) {
                 silentSamplesCount += length;
                 appendShortsToStream(buffer, length);
+                activeSamplesCount += length;
 
+                // 500ms post-roll hangover completed
                 if (silentSamplesCount >= POST_SPEECH_SAMPLES) {
                     flushActiveSpeech();
                 }
@@ -117,7 +145,7 @@ public class OfflineVadEngine {
     }
 
     public synchronized void flushActiveSpeech() {
-        if (!isSpeaking) return;
+        if (!isSpeaking && activeSpeechStream.size() == 0) return;
         isSpeaking = false;
         long speechEndTimeMs = System.currentTimeMillis();
         double avgDb = (dbCount > 0) ? (dbSum / dbCount) : noiseFloorDb;
@@ -125,6 +153,7 @@ public class OfflineVadEngine {
         byte[] completedPcm = activeSpeechStream.toByteArray();
         activeSpeechStream.reset();
         silentSamplesCount = 0;
+        activeSamplesCount = 0;
 
         if (completedPcm.length >= (250 * SAMPLES_PER_MS * BYTES_PER_SAMPLE)) {
             if (callback != null) {
@@ -139,7 +168,7 @@ public class OfflineVadEngine {
         }
     }
 
-    public synchronized byte[] snapshotRecentPcmOrSynthesize(double currentDb) {
+    public synchronized byte[] captureCurrentBufferedPcm() {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         for (short[] frame : preSpeechRingBuffer) {
             for (short s : frame) {
@@ -151,21 +180,6 @@ public class OfflineVadEngine {
             try {
                 activeSpeechStream.writeTo(out);
             } catch (Exception ignored) {}
-        }
-        byte[] raw = out.toByteArray();
-        int minBytes = SAMPLE_RATE * 2 * 2; // 2.0 seconds of 16kHz 16-bit mono PCM
-        if (raw.length >= minBytes / 2) {
-            return raw;
-        }
-        // Append resonant voice-frequency harmonic burst if microphone buffer is short
-        double amp = Math.min(0.85, Math.max(0.25, Math.pow(10.0, currentDb / 20.0)));
-        for (int i = 0; i < SAMPLE_RATE * 2; i++) {
-            double t = (double) i / SAMPLE_RATE;
-            double env = Math.sin((i / (double) (SAMPLE_RATE * 2)) * Math.PI);
-            double wave = 0.6 * Math.sin(2 * Math.PI * 340 * t) + 0.4 * Math.sin(2 * Math.PI * 680 * t);
-            short sample = (short) (32767 * amp * env * wave);
-            out.write(sample & 0xFF);
-            out.write((sample >> 8) & 0xFF);
         }
         return out.toByteArray();
     }

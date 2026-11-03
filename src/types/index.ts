@@ -34,6 +34,8 @@ export interface AudioSegment {
   created_at: number;
   waveform_data?: string;
   is_highlight?: boolean;
+  codec?: string;
+  file_hash?: string;
 }
 
 export interface TestResult {

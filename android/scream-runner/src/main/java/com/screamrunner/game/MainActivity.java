@@ -12,8 +12,13 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -35,27 +40,44 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+/**
+ * MainActivity v3.0 (Scream Runner):
+ * - Delta-time 60 FPS SurfaceView game engine with real-time frame-time (ms) & FPS telemetry.
+ * - Zero UI-thread flooding from the render loop (all HUD metrics drawn directly on Canvas).
+ * - Synthesized AudioTrack sound effects (jump, double jump, coin, shield, hit) with MUTE control.
+ * - Voice-loudness jump with adjustable sensitivity + adaptive noise-floor calibration.
+ * - Explicit consent-gated Android 14–16 foreground microphone recording with 1-tap STOP,
+ *   local clip retention/deletion, and OEM battery-optimization guidance.
+ */
 public class MainActivity extends Activity implements CoordinatedAudioManager.AudioFrameListener, AudioUploadWorker.UploadStatusListener {
 
     private static final int PERMISSION_REQ_CODE = 101;
-    private static final String PREF_GAME = "scream_runner_game_state";
+    private static final String PREF_GAME = "scream_runner_game_state_v3";
     private static final String KEY_HIGH_SCORE = "high_score";
+    private static final String KEY_SOUND_MUTED = "sound_muted";
+    private static final String KEY_KEEP_BG_REC = "keep_bg_recording";
 
     private GameView gameView;
     private TextView micDbText;
-    private TextView scoreText;
     private TextView uploadStatusText;
     private Button recordToggleButton;
     private Button pauseButton;
+    private Button muteButton;
 
-    private boolean isRecordingActive = false;
-    private boolean userExplicitlyConsented = false;
+    private volatile boolean isRecordingActive = false;
+    private volatile boolean userExplicitlyConsented = false;
+    private volatile boolean keepRecordingWhenBackgrounded = true;
+    private volatile boolean soundMuted = false;
     private String currentSessionId = null;
-    private double currentMicDb = -96.0;
-    private double jumpThresholdDb = -25.0;
-    private int uploadedSegmentsCount = 0;
-    private int highScore = 0;
+    private volatile double currentMicDb = -96.0;
+    private volatile double jumpThresholdDb = -26.0;
+    private volatile int uploadedSegmentsCount = 0;
+    private volatile int highScore = 0;
+
+    private final ExecutorService sfxExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -64,6 +86,8 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
         SharedPreferences prefs = getSharedPreferences(PREF_GAME, Context.MODE_PRIVATE);
         highScore = prefs.getInt(KEY_HIGH_SCORE, 0);
+        soundMuted = prefs.getBoolean(KEY_SOUND_MUTED, false);
+        keepRecordingWhenBackgrounded = prefs.getBoolean(KEY_KEEP_BG_REC, true);
 
         AudioUploadWorker.setStatusListener(this);
 
@@ -71,69 +95,47 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         gameView = new GameView(this);
         rootLayout.addView(gameView);
 
-        // Cyberpunk HUD Overlay
+        // Compact Top Controls Bar (Never blocks gameplay area)
         LinearLayout hudLayout = new LinearLayout(this);
         hudLayout.setOrientation(LinearLayout.VERTICAL);
-        hudLayout.setPadding(28, 16, 28, 16);
+        hudLayout.setPadding(24, 12, 24, 8);
 
-        LinearLayout topBar = new LinearLayout(this);
-        topBar.setOrientation(LinearLayout.HORIZONTAL);
-
-        scoreText = new TextView(this);
-        scoreText.setText("SCORE: 0  |  BEST: " + highScore + "  |  COINS: 0  |  SHIELDS: ♥♥♥");
-        scoreText.setTextColor(Color.parseColor("#00F0FF"));
-        scoreText.setTextSize(15);
-        scoreText.setTypeface(null, Typeface.BOLD);
-        topBar.addView(scoreText);
+        LinearLayout topStatusRow = new LinearLayout(this);
+        topStatusRow.setOrientation(LinearLayout.HORIZONTAL);
 
         micDbText = new TextView(this);
-        micDbText.setText("   MIC: OFF (TOUCH MODE)");
+        micDbText.setText("MIC: OFF (TOUCH MODE)");
         micDbText.setTextColor(Color.parseColor("#94A3B8"));
-        micDbText.setTextSize(14);
-        topBar.addView(micDbText);
+        micDbText.setTextSize(12);
+        micDbText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        topStatusRow.addView(micDbText);
 
         uploadStatusText = new TextView(this);
-        uploadStatusText.setText("   [PRIVACY SAFE · CONSENT REQUIRED]");
+        uploadStatusText.setText("   [CONSENT REQUIRED FOR MIC]");
         uploadStatusText.setTextColor(Color.parseColor("#10B981"));
-        uploadStatusText.setTextSize(13);
-        topBar.addView(uploadStatusText);
+        uploadStatusText.setTextSize(12);
+        uploadStatusText.setTypeface(Typeface.MONOSPACE, Typeface.NORMAL);
+        topStatusRow.addView(uploadStatusText);
 
-        hudLayout.addView(topBar);
+        hudLayout.addView(topStatusRow);
 
-        // Control buttons bar
         LinearLayout controlsBar = new LinearLayout(this);
         controlsBar.setOrientation(LinearLayout.HORIZONTAL);
-        controlsBar.setPadding(0, 8, 0, 0);
+        controlsBar.setPadding(0, 6, 0, 0);
 
         recordToggleButton = new Button(this);
-        recordToggleButton.setText("ENABLE VOICE & TELEMETRY");
+        recordToggleButton.setText("VOICE + REC (CONSENT)");
         recordToggleButton.setBackgroundColor(Color.parseColor("#151E2E"));
         recordToggleButton.setTextColor(Color.parseColor("#00F0FF"));
-        recordToggleButton.setTextSize(11);
+        recordToggleButton.setTextSize(10);
         recordToggleButton.setOnClickListener(v -> toggleAuthorizedRecording());
         controlsBar.addView(recordToggleButton);
 
-        Button captureNowBtn = new Button(this);
-        captureNowBtn.setText("SAVE / SYNC CLIP");
-        captureNowBtn.setBackgroundColor(Color.parseColor("#1E293B"));
-        captureNowBtn.setTextColor(Color.parseColor("#FF0055"));
-        captureNowBtn.setTextSize(11);
-        captureNowBtn.setOnClickListener(v -> triggerImmediateClipUpload());
-        controlsBar.addView(captureNowBtn);
-
-        Button localClipsBtn = new Button(this);
-        localClipsBtn.setText("LOCAL CLIPS");
-        localClipsBtn.setBackgroundColor(Color.parseColor("#1E293B"));
-        localClipsBtn.setTextColor(Color.parseColor("#F59E0B"));
-        localClipsBtn.setTextSize(11);
-        localClipsBtn.setOnClickListener(v -> showLocalStorageDialog());
-        controlsBar.addView(localClipsBtn);
-
         Button jumpButton = new Button(this);
-        jumpButton.setText("JUMP / DOUBLE JUMP");
+        jumpButton.setText("JUMP / 2X JUMP");
         jumpButton.setBackgroundColor(Color.parseColor("#151E2E"));
         jumpButton.setTextColor(Color.parseColor("#10B981"));
-        jumpButton.setTextSize(11);
+        jumpButton.setTextSize(10);
         jumpButton.setOnClickListener(v -> gameView.handleActionTap(1.0));
         controlsBar.addView(jumpButton);
 
@@ -141,46 +143,35 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         pauseButton.setText("PAUSE");
         pauseButton.setBackgroundColor(Color.parseColor("#1E293B"));
         pauseButton.setTextColor(Color.parseColor("#E2E8F0"));
-        pauseButton.setTextSize(11);
+        pauseButton.setTextSize(10);
         pauseButton.setOnClickListener(v -> gameView.togglePause());
         controlsBar.addView(pauseButton);
 
-        Button serverBtn = new Button(this);
-        serverBtn.setText("SERVER URL");
-        serverBtn.setBackgroundColor(Color.parseColor("#1E293B"));
-        serverBtn.setTextColor(Color.parseColor("#94A3B8"));
-        serverBtn.setTextSize(11);
-        serverBtn.setOnClickListener(v -> showServerConfigDialog());
-        controlsBar.addView(serverBtn);
+        muteButton = new Button(this);
+        muteButton.setText(soundMuted ? "SFX: MUTED" : "SFX: ON");
+        muteButton.setBackgroundColor(Color.parseColor("#1E293B"));
+        muteButton.setTextColor(Color.parseColor(soundMuted ? "#F59E0B" : "#00F0FF"));
+        muteButton.setTextSize(10);
+        muteButton.setOnClickListener(v -> toggleMute());
+        controlsBar.addView(muteButton);
+
+        Button localClipsBtn = new Button(this);
+        localClipsBtn.setText("LOCAL CLIPS");
+        localClipsBtn.setBackgroundColor(Color.parseColor("#1E293B"));
+        localClipsBtn.setTextColor(Color.parseColor("#F59E0B"));
+        localClipsBtn.setTextSize(10);
+        localClipsBtn.setOnClickListener(v -> showLocalStorageDialog());
+        controlsBar.addView(localClipsBtn);
+
+        Button settingsBtn = new Button(this);
+        settingsBtn.setText("SETTINGS & BATTERY");
+        settingsBtn.setBackgroundColor(Color.parseColor("#1E293B"));
+        settingsBtn.setTextColor(Color.parseColor("#94A3B8"));
+        settingsBtn.setTextSize(10);
+        settingsBtn.setOnClickListener(v -> showSettingsAndBatteryDialog());
+        controlsBar.addView(settingsBtn);
 
         hudLayout.addView(controlsBar);
-
-        // Sensitivity Seekbar Row
-        LinearLayout gateRow = new LinearLayout(this);
-        gateRow.setOrientation(LinearLayout.HORIZONTAL);
-        gateRow.setPadding(0, 6, 0, 0);
-
-        TextView gateLabel = new TextView(this);
-        gateLabel.setText("VOICE JUMP SENSITIVITY: ");
-        gateLabel.setTextColor(Color.parseColor("#94A3B8"));
-        gateLabel.setTextSize(11);
-        gateRow.addView(gateLabel);
-
-        SeekBar sensitivityBar = new SeekBar(this);
-        sensitivityBar.setMax(50);
-        sensitivityBar.setProgress(25);
-        sensitivityBar.setLayoutParams(new LinearLayout.LayoutParams(320, LinearLayout.LayoutParams.WRAP_CONTENT));
-        sensitivityBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                jumpThresholdDb = -(55 - progress);
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
-            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
-        });
-        gateRow.addView(sensitivityBar);
-
-        hudLayout.addView(gateRow);
         rootLayout.addView(hudLayout);
 
         setContentView(rootLayout);
@@ -195,63 +186,165 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void handleIncomingIntent(Intent intent) {
         if (intent != null && SmartRecordingService.ACTION_STOP_FROM_NOTIFICATION.equals(intent.getAction())) {
-            stopActiveConsentSession("Stopped via notification privacy control");
+            stopActiveConsentSession("Stopped via notification STOP control");
         }
     }
 
-    private void triggerImmediateClipUpload() {
-        if (!isRecordingActive || !userExplicitlyConsented) {
-            showConsentDisclosureDialog();
-            return;
-        }
-        SmartRecordingService.getInstance(this).captureImmediateClip(currentSessionId);
-        uploadStatusText.setText("   [SAVING & SYNCING WAV...]");
+    private void toggleMute() {
+        soundMuted = !soundMuted;
+        getSharedPreferences(PREF_GAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_SOUND_MUTED, soundMuted)
+                .apply();
+        muteButton.setText(soundMuted ? "SFX: MUTED" : "SFX: ON");
+        muteButton.setTextColor(Color.parseColor(soundMuted ? "#F59E0B" : "#00F0FF"));
+    }
+
+    private void playSynthesizedSfx(final int freqStart, final int freqEnd, final int durationMs) {
+        if (soundMuted) return;
+        sfxExecutor.execute(() -> {
+            AudioTrack track = null;
+            try {
+                int sampleRate = 16000;
+                int numSamples = Math.max(160, (sampleRate * durationMs) / 1000);
+                short[] pcm = new short[numSamples];
+                for (int i = 0; i < numSamples; i++) {
+                    double progress = (double) i / numSamples;
+                    double freq = freqStart + (freqEnd - freqStart) * progress;
+                    double env = 1.0 - progress;
+                    pcm[i] = (short) (Math.sin(2.0 * Math.PI * i * freq / sampleRate) * 10000 * env);
+                }
+                int bufBytes = numSamples * 2;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    track = new AudioTrack(
+                            new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_GAME)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                    .build(),
+                            new AudioFormat.Builder()
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .setSampleRate(sampleRate)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                    .build(),
+                            Math.max(bufBytes, AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)),
+                            AudioTrack.MODE_STATIC,
+                            AudioManager.AUDIO_SESSION_ID_GENERATE
+                    );
+                } else {
+                    track = new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, AudioFormat.CHANNEL_OUT_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT, Math.max(bufBytes, 2048), AudioTrack.MODE_STATIC);
+                }
+                track.write(pcm, 0, numSamples);
+                track.play();
+                Thread.sleep(durationMs + 20L);
+            } catch (Exception ignored) {
+            } finally {
+                if (track != null) {
+                    try {
+                        track.release();
+                    } catch (Exception ignored) {}
+                }
+            }
+        });
     }
 
     private void showLocalStorageDialog() {
-        List<File> clips = SmartRecordingService.getInstance(this).listLocalClips();
+        SmartRecordingService svc = SmartRecordingService.getInstance(this);
+        List<File> clips = svc.listLocalClips();
+        int pendingCount = AudioUploadWorker.getPendingQueueSize(this);
         long totalBytes = 0;
         StringBuilder details = new StringBuilder();
+        details.append("Retention Policy: Auto-delete local clips older than ").append(svc.getRetentionDays()).append(" days\n");
+        details.append("Pending Offline Upload Queue: ").append(pendingCount).append(" clips\n\n");
+
         for (int i = 0; i < clips.size(); i++) {
             File f = clips.get(i);
             totalBytes += f.length();
             if (i < 8) {
-                details.append("• ").append(f.getName()).append(" (").append(f.length() / 1024).append(" KB)\n");
+                details.append("• ").append(f.getName()).append(" (").append(Math.max(1, f.length() / 1024)).append(" KB)\n");
             }
         }
         if (clips.isEmpty()) {
-            details.append("No local WAV clips currently stored in app-private sandbox.");
+            details.append("No local M4A/WAV clips currently stored in app-private sandbox.");
         }
 
         new AlertDialog.Builder(this)
-                .setTitle("App-Private Local Audio Storage (" + clips.size() + " clips · " + (totalBytes / 1024) + " KB)")
-                .setMessage("Path: " + SmartRecordingService.getInstance(this).getSecureStorageRoot().getAbsolutePath() + "\n\n" + details)
-                .setPositiveButton("OK", null)
-                .setNeutralButton("WIPE ALL LOCAL CLIPS", (d, w) -> {
-                    int count = SmartRecordingService.getInstance(this).deleteAllLocalClips();
-                    Toast.makeText(this, "Deleted " + count + " local WAV clips", Toast.LENGTH_SHORT).show();
+                .setTitle("App-Private Audio Storage (" + clips.size() + " clips · " + (totalBytes / 1024) + " KB)")
+                .setMessage(details.toString())
+                .setPositiveButton("RETRY OFFLINE QUEUE", (d, w) -> {
+                    AudioUploadWorker.flushPendingQueue(this);
+                    Toast.makeText(this, "Flushing offline upload queue...", Toast.LENGTH_SHORT).show();
                 })
+                .setNeutralButton("WIPE ALL LOCAL CLIPS", (d, w) -> {
+                    int count = svc.deleteAllLocalClips();
+                    Toast.makeText(this, "Deleted " + count + " local audio clips", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("CLOSE", null)
                 .show();
     }
 
-    private void showServerConfigDialog() {
-        EditText input = new EditText(this);
-        input.setText(AudioUploadWorker.getBaseUrl(this));
-        input.setTextColor(Color.WHITE);
-        input.setBackgroundColor(Color.parseColor("#0F172A"));
-        input.setPadding(24, 20, 24, 20);
+    private void showSettingsAndBatteryDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(36, 24, 36, 16);
+        layout.setBackgroundColor(Color.parseColor("#0F172A"));
+
+        TextView sensLabel = new TextView(this);
+        sensLabel.setText(String.format(Locale.US, "Voice Jump & VAD Sensitivity Gate: %.0f dB", jumpThresholdDb));
+        sensLabel.setTextColor(Color.parseColor("#00F0FF"));
+        sensLabel.setTextSize(12);
+        layout.addView(sensLabel);
+
+        SeekBar sensBar = new SeekBar(this);
+        sensBar.setMax(45);
+        sensBar.setProgress((int) (jumpThresholdDb + 55));
+        sensBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                jumpThresholdDb = -55 + progress;
+                sensLabel.setText(String.format(Locale.US, "Voice Jump & VAD Sensitivity Gate: %.0f dB", jumpThresholdDb));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        layout.addView(sensBar);
+
+        TextView urlLabel = new TextView(this);
+        urlLabel.setText("\nTelemetry HTTPS Server Endpoint:");
+        urlLabel.setTextColor(Color.parseColor("#94A3B8"));
+        urlLabel.setTextSize(12);
+        layout.addView(urlLabel);
+
+        EditText urlInput = new EditText(this);
+        urlInput.setText(AudioUploadWorker.getBaseUrl(this));
+        urlInput.setTextColor(Color.WHITE);
+        urlInput.setTextSize(12);
+        layout.addView(urlInput);
+
+        TextView batteryInfo = new TextView(this);
+        batteryInfo.setText("\nOEM Battery & Background Recording Guidance (Android 14–16):\n" +
+                "• Samsung OneUI: Settings -> Apps -> Scream Runner -> Battery -> Unrestricted.\n" +
+                "• Xiaomi MIUI/HyperOS: App Info -> Battery Saver -> No restrictions.\n" +
+                "• OnePlus/Oppo: App Info -> Battery Usage -> Allow background activity.\n" +
+                "Note: Android's green microphone indicator and persistent STOP notification always remain visible while active.");
+        batteryInfo.setTextColor(Color.parseColor("#CBD5E1"));
+        batteryInfo.setTextSize(11);
+        layout.addView(batteryInfo);
 
         new AlertDialog.Builder(this)
-                .setTitle("Telemetry Server Configuration")
-                .setMessage("Configure the HTTPS endpoint used when you explicitly enable audio telemetry sync:")
-                .setView(input)
-                .setPositiveButton("SAVE", (d, w) -> {
-                    AudioUploadWorker.setBaseUrl(this, input.getText().toString());
-                    Toast.makeText(this, "Telemetry URL updated", Toast.LENGTH_SHORT).show();
+                .setTitle("Scream Runner v3.0 Settings")
+                .setView(layout)
+                .setPositiveButton("SAVE SETTINGS", (d, w) -> {
+                    AudioUploadWorker.setBaseUrl(this, urlInput.getText().toString());
+                    SmartRecordingService.getInstance(this).getVadEngine().triggerCalibration();
+                    Toast.makeText(this, "Settings saved & noise floor calibrated", Toast.LENGTH_SHORT).show();
                 })
-                .setNeutralButton("CLOUD DEFAULT", (d, w) -> {
-                    AudioUploadWorker.setBaseUrl(this, AudioUploadWorker.DEFAULT_CLOUD_URL);
-                    Toast.makeText(this, "Reset to default HTTPS endpoint", Toast.LENGTH_SHORT).show();
+                .setNeutralButton("ANDROID BATTERY SETTINGS", (d, w) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                    } catch (Exception e) {
+                        Toast.makeText(this, "Open Android Settings -> Apps -> Scream Runner -> Battery", Toast.LENGTH_LONG).show();
+                    }
                 })
                 .setNegativeButton("CANCEL", null)
                 .show();
@@ -259,8 +352,17 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void requestMicPermissionAndActivate() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            List<String> needed = new ArrayList<>();
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSION_REQ_CODE);
+                needed.add(Manifest.permission.RECORD_AUDIO);
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                    needed.add("android.permission.POST_NOTIFICATIONS");
+                }
+            }
+            if (!needed.isEmpty()) {
+                requestPermissions(needed.toArray(new String[0]), PERMISSION_REQ_CODE);
                 return;
             }
         }
@@ -271,12 +373,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQ_CODE) {
-            boolean audioGranted = false;
-            for (int i = 0; i < permissions.length; i++) {
-                if (Manifest.permission.RECORD_AUDIO.equals(permissions[i]) && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
-                    audioGranted = true;
-                }
-            }
+            boolean audioGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
             if (audioGranted && userExplicitlyConsented) {
                 activateConsentedSession();
             } else {
@@ -291,11 +388,11 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         CoordinatedAudioManager.getInstance().registerGameplayListener(this);
         SmartRecordingService.getInstance(this).startSession(currentSessionId);
         isRecordingActive = true;
-        recordToggleButton.setText("● MIC ACTIVE — TAP TO STOP");
+        recordToggleButton.setText("● STOP REC");
         recordToggleButton.setBackgroundColor(Color.parseColor("#3B0D1E"));
         recordToggleButton.setTextColor(Color.parseColor("#FF0055"));
         micDbText.setTextColor(Color.parseColor("#FF0055"));
-        uploadStatusText.setText("   [VAD ACTIVE · VISIBLE INDICATOR ON]");
+        uploadStatusText.setText("   [300ms PRE-ROLL VAD ACTIVE · TAP STOP TO END]");
     }
 
     private void stopActiveConsentSession(String reason) {
@@ -304,27 +401,35 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         CoordinatedAudioManager.getInstance().stopCapture();
         isRecordingActive = false;
         userExplicitlyConsented = false;
-        recordToggleButton.setText("ENABLE VOICE & TELEMETRY");
+        recordToggleButton.setText("VOICE + REC (CONSENT)");
         recordToggleButton.setBackgroundColor(Color.parseColor("#151E2E"));
         recordToggleButton.setTextColor(Color.parseColor("#00F0FF"));
-        micDbText.setText("   MIC: OFF (TOUCH MODE)");
+        micDbText.setText("MIC: OFF (TOUCH MODE)");
         micDbText.setTextColor(Color.parseColor("#94A3B8"));
-        uploadStatusText.setText("   [MIC STOPPED]");
+        uploadStatusText.setText("   [MIC STOPPED & RELEASED]");
         if (reason != null) {
             Toast.makeText(this, reason, Toast.LENGTH_SHORT).show();
         }
     }
+
+    private long lastUiMicUpdateMs = 0;
 
     @Override
     public void onAudioFrame(short[] buffer, int readSamples, double measuredDb) {
         if (!isRecordingActive || !userExplicitlyConsented) return;
         currentMicDb = measuredDb;
 
-        runOnUiThread(() -> {
-            if (micDbText != null && isRecordingActive) {
-                micDbText.setText(String.format(Locale.US, "   MIC: %.1f dB (GATE: %.0f dB)", currentMicDb, jumpThresholdDb));
-            }
-        });
+        long now = System.currentTimeMillis();
+        if (now - lastUiMicUpdateMs > 120) {
+            lastUiMicUpdateMs = now;
+            final double noiseFloor = SmartRecordingService.getInstance(this).getVadEngine().getNoiseFloorDb();
+            runOnUiThread(() -> {
+                if (micDbText != null && isRecordingActive) {
+                    micDbText.setText(String.format(Locale.US, "MIC: %.1f dB (FLOOR: %.0f dB | GATE: %.0f dB)",
+                            currentMicDb, noiseFloor, jumpThresholdDb));
+                }
+            });
+        }
 
         if (measuredDb > jumpThresholdDb) {
             double intensity = Math.min(1.0, Math.max(0.25, (measuredDb - jumpThresholdDb) / 20.0));
@@ -336,7 +441,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     public void onSessionRegistered(String sessionId, String deviceName) {
         runOnUiThread(() -> {
             if (uploadStatusText != null && isRecordingActive) {
-                uploadStatusText.setText("   [VAD LIVE · " + sessionId + "]");
+                uploadStatusText.setText("   [ENROLLED · " + sessionId + "]");
             }
         });
     }
@@ -348,7 +453,6 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
             if (uploadStatusText != null) {
                 uploadStatusText.setText(String.format(Locale.US, "   [SYNCED #%d · %.1f dB]", uploadedSegmentsCount, peakDb));
             }
-            Toast.makeText(this, "Synced Clip #" + seqIndex + " (" + String.format(Locale.US, "%.1f", peakDb) + " dB)", Toast.LENGTH_SHORT).show();
         });
     }
 
@@ -363,7 +467,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void toggleAuthorizedRecording() {
         if (isRecordingActive) {
-            stopActiveConsentSession("Microphone stopped & released");
+            stopActiveConsentSession("Microphone stopped & hardware released");
         } else {
             showConsentDisclosureDialog();
         }
@@ -371,21 +475,22 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void showConsentDisclosureDialog() {
         new AlertDialog.Builder(this)
-                .setTitle("Explicit Consent: Microphone & Telemetry")
-                .setMessage("Scream Runner requests your explicit authorization to enable microphone input during this active session:\n\n" +
-                        "1. Voice Jump & On-Device VAD: Microphone audio is analyzed in real time for voice-controlled jumping and speech burst detection.\n" +
-                        "2. Visible Privacy Indicator & Stop Controls: While active, a red HUD indicator and system notification are shown. You can stop microphone access at any time with 1 tap.\n" +
-                        "3. No Background Recording: Microphone capture automatically stops the moment you pause, minimize, or close the app.\n" +
-                        "4. Secure Storage & Sync: Clips are saved in app-private storage and synced over HTTPS to " + AudioUploadWorker.getBaseUrl(this) + ".\n\n" +
-                        "Select how you would like to proceed:")
-                .setPositiveButton("CONSENT (LOCAL + HTTPS SYNC)", (dialog, which) -> {
+                .setTitle("Explicit Consent: Voice Jump & Audio Recording (v3.0)")
+                .setMessage("Scream Runner requests your explicit authorization to enable microphone access:\n\n" +
+                        "1. Voice Jump & Adaptive VAD: Uses a 300ms pre-roll and 500ms post-roll buffer with automatic noise-floor calibration.\n" +
+                        "2. Android 14–16 Foreground Compliance: Displays a persistent system notification with a 1-tap STOP RECORDING button while active.\n" +
+                        "3. Background & Screen-Off Choice: Choose below whether recording should continue via the foreground notification if you switch apps, or stop immediately on pause.\n" +
+                        "4. Encrypted HTTPS Sync: Clips are encoded to AAC/M4A (or lossless WAV), verified with SHA-256, and uploaded to " + AudioUploadWorker.getBaseUrl(this) + ".")
+                .setPositiveButton("CONSENT (FOREGROUND + BACKGROUND)", (dialog, which) -> {
                     userExplicitlyConsented = true;
+                    keepRecordingWhenBackgrounded = true;
                     SmartRecordingService.getInstance(this).setSyncUploadEnabled(true);
                     requestMicPermissionAndActivate();
                 })
-                .setNeutralButton("CONSENT (LOCAL ONLY, NO UPLOAD)", (dialog, which) -> {
+                .setNeutralButton("CONSENT (IN-APP ONLY)", (dialog, which) -> {
                     userExplicitlyConsented = true;
-                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(false);
+                    keepRecordingWhenBackgrounded = false;
+                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(true);
                     requestMicPermissionAndActivate();
                 })
                 .setNegativeButton("DECLINE (TOUCH ONLY)", (dialog, which) -> {
@@ -412,8 +517,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     protected void onPause() {
         super.onPause();
         gameView.pauseLoop();
-        // Guarantee zero hidden background microphone capture when the user leaves the foreground
-        if (isRecordingActive) {
+        if (isRecordingActive && !keepRecordingWhenBackgrounded) {
             stopActiveConsentSession(null);
         }
     }
@@ -423,13 +527,15 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         if (isRecordingActive) {
             stopActiveConsentSession(null);
         }
+        sfxExecutor.shutdownNow();
         super.onDestroy();
     }
 
-    // ----------------- Complete Playable 60 FPS 2D Cyberpunk Runner -----------------
+    // ----------------- Delta-Time 60 FPS 2D Endless Runner Engine -----------------
     private class GameView extends SurfaceView implements SurfaceHolder.Callback, Runnable {
         private Thread gameThread;
         private volatile boolean isRunningLoop = false;
+        private volatile boolean inTitleMenu = true;
         private volatile boolean isPaused = false;
         private volatile boolean isGameOver = false;
 
@@ -437,13 +543,15 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-        private float playerX = 160;
-        private float playerY = 400;
-        private float playerVelocityY = 0;
-        private final float gravity = 1.15f;
-        private float groundY = 500;
-        private int jumpsRemaining = 2; // Supports Double Jump
+        private float playerX = 160f;
+        private float playerY = 400f;
+        private float playerVelocityY = 0f;
+        private final float gravityPxPerSec2 = 1650f;
+        private float groundY = 500f;
+        private int jumpsRemaining = 2;
+        private long lastVoiceJumpMs = 0;
 
+        private float scoreFloat = 0f;
         private int score = 0;
         private int coins = 0;
         private int shields = 3;
@@ -451,10 +559,18 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         private int level = 1;
         private long invulnerableUntil = 0;
 
+        // Frame-time & FPS telemetry
+        private float currentFps = 60.0f;
+        private float avgFrameTimeMs = 4.2f;
+
+        private static final int OBS_GROUND_SPIKE = 0;
+        private static final int OBS_AERIAL_DRONE = 1;
+        private static final int OBS_LASER_TOWER = 2;
+
         private class Obstacle {
             RectF rect;
-            boolean isAerial;
-            Obstacle(RectF r, boolean aerial) { this.rect = r; this.isAerial = aerial; }
+            int type;
+            Obstacle(RectF r, int type) { this.rect = r; this.type = type; }
         }
 
         private class Particle {
@@ -470,8 +586,9 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         private final List<RectF> shieldItems = new ArrayList<>();
         private final List<Particle> particles = new ArrayList<>();
         private final Random random = new Random();
-        private long lastSpawnTime = 0;
-        private float gridOffset = 0;
+        private float spawnTimerSec = 0f;
+        private float gridOffset = 0f;
+        private float starOffset = 0f;
 
         public GameView(Context context) {
             super(context);
@@ -481,8 +598,15 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         }
 
         public synchronized void handleActionTap(double intensity) {
+            if (inTitleMenu) {
+                inTitleMenu = false;
+                resetGame();
+                playSynthesizedSfx(440, 660, 70);
+                return;
+            }
             if (isGameOver) {
                 resetGame();
+                playSynthesizedSfx(440, 660, 70);
                 return;
             }
             if (isPaused) {
@@ -490,23 +614,29 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                 return;
             }
             if (jumpsRemaining > 0) {
-                playerVelocityY = (float) (-18.5 - (10.5 * intensity));
+                boolean isFirstJump = (jumpsRemaining == 2);
+                playerVelocityY = (float) (-620.0 - (240.0 * intensity));
                 jumpsRemaining--;
-                spawnParticles(playerX + 20, playerY + 48, Color.parseColor("#00F0FF"), 8);
+                spawnParticles(playerX + 20, playerY + 48, Color.parseColor("#00F0FF"), 10);
+                playSynthesizedSfx(isFirstJump ? 380 : 520, isFirstJump ? 620 : 840, 65);
             }
         }
 
         public synchronized void triggerVoiceJump(double intensity) {
-            if (isGameOver || isPaused) return;
-            if (playerY >= groundY - 14) {
-                playerVelocityY = (float) (-19.0 - (11.5 * intensity));
-                jumpsRemaining = 1;
-                spawnParticles(playerX + 20, playerY + 48, Color.parseColor("#FF0055"), 6);
+            if (inTitleMenu || isGameOver || isPaused) return;
+            long now = System.currentTimeMillis();
+            if (now - lastVoiceJumpMs < 220) return;
+            if (playerY >= groundY - 18 || jumpsRemaining == 1) {
+                lastVoiceJumpMs = now;
+                playerVelocityY = (float) (-640.0 - (260.0 * intensity));
+                jumpsRemaining = Math.max(0, jumpsRemaining - 1);
+                spawnParticles(playerX + 20, playerY + 48, Color.parseColor("#FF0055"), 8);
+                playSynthesizedSfx(420, 740, 60);
             }
         }
 
         public synchronized void togglePause() {
-            if (isGameOver) return;
+            if (inTitleMenu || isGameOver) return;
             isPaused = !isPaused;
             runOnUiThread(() -> {
                 if (pauseButton != null) {
@@ -516,6 +646,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         }
 
         public synchronized void resetGame() {
+            scoreFloat = 0f;
             score = 0;
             coins = 0;
             shields = 3;
@@ -523,108 +654,130 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
             level = 1;
             jumpsRemaining = 2;
             playerY = groundY;
-            playerVelocityY = 0;
+            playerVelocityY = 0f;
             obstacles.clear();
             coinItems.clear();
             shieldItems.clear();
             particles.clear();
             isGameOver = false;
             isPaused = false;
-            lastSpawnTime = System.currentTimeMillis();
+            spawnTimerSec = 0f;
         }
 
         private void spawnParticles(float cx, float cy, int color, int count) {
             for (int i = 0; i < count; i++) {
-                float vx = (random.nextFloat() - 0.5f) * 14f;
-                float vy = (random.nextFloat() - 0.5f) * 14f;
+                float vx = (random.nextFloat() - 0.5f) * 420f;
+                float vy = (random.nextFloat() - 0.5f) * 420f;
                 particles.add(new Particle(cx, cy, vx, vy, color));
             }
         }
 
         @Override
         public void run() {
-            long targetFrameTime = 1000 / 60;
+            long lastNano = System.nanoTime();
+            final long targetFrameNs = 16_666_667L; // 60 FPS = 16.67ms
+
             while (isRunningLoop) {
-                long frameStart = System.currentTimeMillis();
-                if (!isPaused && !isGameOver) {
-                    updatePhysics();
+                long nowNano = System.nanoTime();
+                float dt = (nowNano - lastNano) / 1_000_000_000.0f;
+                lastNano = nowNano;
+                if (dt <= 0f || dt > 0.1f) {
+                    dt = 0.0166f;
+                }
+
+                if (!inTitleMenu && !isPaused && !isGameOver) {
+                    updatePhysics(dt);
                 }
                 drawFrame();
-                long elapsed = System.currentTimeMillis() - frameStart;
-                long sleepTime = targetFrameTime - elapsed;
-                if (sleepTime > 0) {
+
+                long workNs = System.nanoTime() - nowNano;
+                float workMs = workNs / 1_000_000.0f;
+                avgFrameTimeMs = 0.9f * avgFrameTimeMs + 0.1f * workMs;
+
+                long sleepNs = targetFrameNs - workNs;
+                if (sleepNs > 1_000_000L) {
                     try {
-                        Thread.sleep(sleepTime);
+                        Thread.sleep(sleepNs / 1_000_000L);
                     } catch (InterruptedException e) {
                         break;
                     }
                 }
+                long totalFrameNs = Math.max(1_000_000L, System.nanoTime() - nowNano);
+                float instantFps = 1_000_000_000.0f / totalFrameNs;
+                currentFps = 0.9f * currentFps + 0.1f * Math.min(60.0f, instantFps);
             }
         }
 
-        private synchronized void updatePhysics() {
+        private synchronized void updatePhysics(float dt) {
             int h = getHeight();
             int w = getWidth();
             if (h > 200) {
-                groundY = h * 0.76f;
+                groundY = h * 0.78f;
             }
 
-            level = 1 + (score / 1200);
-            float scrollSpeed = Math.min(22f, 10.5f + (level * 1.4f));
-            gridOffset = (gridOffset + scrollSpeed) % 60;
+            level = 1 + (score / 1000);
+            float scrollSpeedPxPerSec = Math.min(820f, 380f + (level * 48f));
+            gridOffset = (gridOffset + scrollSpeedPxPerSec * dt) % 60f;
+            starOffset = (starOffset + scrollSpeedPxPerSec * 0.25f * dt) % Math.max(1, w);
 
-            playerVelocityY += gravity;
-            playerY += playerVelocityY;
+            playerVelocityY += gravityPxPerSec2 * dt;
+            playerY += playerVelocityY * dt;
 
             if (playerY >= groundY) {
                 playerY = groundY;
-                playerVelocityY = 0;
+                playerVelocityY = 0f;
                 jumpsRemaining = 2;
             }
 
-            score += combo;
+            scoreFloat += (60f * dt * combo);
+            score = (int) scoreFloat;
             if (score > highScore) {
                 saveHighScore(score);
             }
 
-            long now = System.currentTimeMillis();
-            long spawnInterval = Math.max(850, 1750 - (level * 110L));
-            if (now - lastSpawnTime > spawnInterval && w > 0) {
-                boolean aerial = random.nextInt(100) < 28;
-                if (aerial) {
-                    float droneY = groundY - 95 - random.nextInt(55);
-                    obstacles.add(new Obstacle(new RectF(w + 80, droneY, w + 135, droneY + 38), true));
+            spawnTimerSec += dt;
+            float spawnIntervalSec = Math.max(0.75f, 1.65f - (level * 0.09f));
+            if (spawnTimerSec >= spawnIntervalSec && w > 0) {
+                spawnTimerSec = 0f;
+                int roll = random.nextInt(100);
+                if (roll < 28) {
+                    float droneY = groundY - 95 - random.nextInt(60);
+                    obstacles.add(new Obstacle(new RectF(w + 60, droneY, w + 120, droneY + 38), OBS_AERIAL_DRONE));
+                } else if (roll < 55) {
+                    float towerH = 95 + random.nextInt(45);
+                    obstacles.add(new Obstacle(new RectF(w + 60, groundY + 50 - towerH, w + 96, groundY + 50), OBS_LASER_TOWER));
                 } else {
-                    float obsWidth = 42 + random.nextInt(34);
-                    float obsHeight = 62 + random.nextInt(58);
-                    obstacles.add(new Obstacle(new RectF(w + 80, groundY + 50 - obsHeight, w + 80 + obsWidth, groundY + 50), false));
+                    float obsWidth = 44 + random.nextInt(32);
+                    float obsHeight = 58 + random.nextInt(48);
+                    obstacles.add(new Obstacle(new RectF(w + 60, groundY + 50 - obsHeight, w + 60 + obsWidth, groundY + 50), OBS_GROUND_SPIKE));
                 }
 
                 int coinCount = 1 + random.nextInt(3);
                 for (int c = 0; c < coinCount; c++) {
-                    float cx = w + 120 + (c * 48);
-                    float cy = groundY - 95 - (c % 2 == 0 ? 0 : 30);
-                    coinItems.add(new RectF(cx, cy, cx + 30, cy + 30));
+                    float cx = w + 130 + (c * 52);
+                    float cy = groundY - 90 - (c % 2 == 0 ? 0 : 32);
+                    coinItems.add(new RectF(cx, cy, cx + 28, cy + 28));
                 }
 
                 if (shields < 3 && random.nextInt(100) < 18) {
                     shieldItems.add(new RectF(w + 260, groundY - 140, w + 294, groundY - 106));
                 }
-
-                lastSpawnTime = now;
             }
 
-            RectF playerRect = new RectF(playerX, playerY, playerX + 46, playerY + 50);
+            // Slightly forgiving hitbox for fair gameplay
+            RectF playerRect = new RectF(playerX + 5, playerY + 5, playerX + 41, playerY + 46);
+            long now = System.currentTimeMillis();
 
             for (int i = obstacles.size() - 1; i >= 0; i--) {
                 Obstacle obs = obstacles.get(i);
-                obs.rect.offset(-scrollSpeed, 0);
+                obs.rect.offset(-scrollSpeedPxPerSec * dt, 0);
                 if (RectF.intersects(obs.rect, playerRect)) {
                     if (now > invulnerableUntil) {
                         shields--;
                         combo = 1;
                         invulnerableUntil = now + 1200;
                         spawnParticles(playerX + 24, playerY + 24, Color.parseColor("#FF0055"), 18);
+                        playSynthesizedSfx(220, 110, 140);
                         if (shields <= 0) {
                             isGameOver = true;
                         }
@@ -632,18 +785,19 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                     obstacles.remove(i);
                 } else if (obs.rect.right < 0) {
                     obstacles.remove(i);
-                    score += 15 * combo;
+                    scoreFloat += 15 * combo;
                 }
             }
 
             for (int i = coinItems.size() - 1; i >= 0; i--) {
                 RectF c = coinItems.get(i);
-                c.offset(-scrollSpeed, 0);
+                c.offset(-scrollSpeedPxPerSec * dt, 0);
                 if (RectF.intersects(c, playerRect)) {
                     coins++;
                     combo = Math.min(8, combo + 1);
-                    score += 50 * combo;
+                    scoreFloat += 50 * combo;
                     spawnParticles(c.centerX(), c.centerY(), Color.parseColor("#F59E0B"), 10);
+                    playSynthesizedSfx(660, 990, 55);
                     coinItems.remove(i);
                 } else if (c.right < 0) {
                     coinItems.remove(i);
@@ -652,10 +806,11 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
             for (int i = shieldItems.size() - 1; i >= 0; i--) {
                 RectF s = shieldItems.get(i);
-                s.offset(-scrollSpeed, 0);
+                s.offset(-scrollSpeedPxPerSec * dt, 0);
                 if (RectF.intersects(s, playerRect)) {
                     shields = Math.min(3, shields + 1);
                     spawnParticles(s.centerX(), s.centerY(), Color.parseColor("#10B981"), 12);
+                    playSynthesizedSfx(520, 880, 90);
                     shieldItems.remove(i);
                 } else if (s.right < 0) {
                     shieldItems.remove(i);
@@ -664,20 +819,13 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
             for (int i = particles.size() - 1; i >= 0; i--) {
                 Particle p = particles.get(i);
-                p.x += p.vx;
-                p.y += p.vy;
-                p.alpha -= 0.04f;
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+                p.alpha -= 2.2f * dt;
                 if (p.alpha <= 0) {
                     particles.remove(i);
                 }
             }
-
-            final String shieldStr = shields == 3 ? "♥♥♥" : (shields == 2 ? "♥♥♡" : (shields == 1 ? "♥♡♡" : "♡♡♡"));
-            runOnUiThread(() -> {
-                if (scoreText != null) {
-                    scoreText.setText("SCORE: " + score + " | BEST: " + highScore + " | COINS: " + coins + " (x" + combo + ") | SHIELDS: " + shieldStr);
-                }
-            });
         }
 
         private synchronized void drawFrame() {
@@ -688,35 +836,56 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
             try {
                 int w = getWidth();
                 int h = getHeight();
+                if (h > 200) {
+                    groundY = h * 0.78f;
+                }
 
                 canvas.drawColor(Color.parseColor("#080B11"));
 
+                // Parallax Layer 1: Starfield
                 paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.parseColor("#334155"));
+                for (int s = 0; s < 18; s++) {
+                    float sx = ((s * 137f) - starOffset + w) % Math.max(1, w);
+                    float sy = 90f + ((s * 53) % (int) Math.max(100, groundY - 120));
+                    canvas.drawCircle(sx, sy, (s % 2 == 0) ? 2.5f : 1.5f, paint);
+                }
+
+                // Parallax Layer 2: Distant City Skyline
                 paint.setColor(Color.parseColor("#0D1526"));
-                for (int i = 0; i < 10; i++) {
-                    float bx = ((i * 220) - (gridOffset * 0.5f));
-                    float bh = 90 + (i % 3) * 55;
-                    canvas.drawRect(bx, groundY + 50 - bh, bx + 140, groundY + 50, paint);
+                for (int i = 0; i < 12; i++) {
+                    float bx = ((i * 210f) - (gridOffset * 0.5f));
+                    float bh = 85f + (i % 4) * 50f;
+                    canvas.drawRect(bx, groundY + 50 - bh, bx + 135, groundY + 50, paint);
                 }
 
+                // Synthwave Floor Grid
                 paint.setColor(Color.parseColor("#131E32"));
-                paint.setStrokeWidth(2);
-                for (int y = 0; y < h; y += 45) {
-                    canvas.drawLine(0, y, w, y, paint);
-                }
-                for (float x = -gridOffset; x < w; x += 60) {
-                    canvas.drawLine(x, groundY + 50, x - 40, h, paint);
+                paint.setStrokeWidth(2f);
+                for (float x = -gridOffset; x < w; x += 60f) {
+                    canvas.drawLine(x, groundY + 50, x - 45, h, paint);
                 }
 
+                // Ground Horizon Line
                 paint.setColor(Color.parseColor("#00F0FF"));
-                paint.setStrokeWidth(5);
+                paint.setStrokeWidth(5f);
                 canvas.drawLine(0, groundY + 50, w, groundY + 50, paint);
 
+                // Obstacles
                 for (Obstacle obs : obstacles) {
-                    paint.setColor(obs.isAerial ? Color.parseColor("#A855F7") : Color.parseColor("#FF0055"));
-                    canvas.drawRoundRect(obs.rect, 10, 10, paint);
+                    if (obs.type == OBS_AERIAL_DRONE) {
+                        paint.setColor(Color.parseColor("#A855F7"));
+                        canvas.drawOval(obs.rect, paint);
+                    } else if (obs.type == OBS_LASER_TOWER) {
+                        paint.setColor(Color.parseColor("#F43F5E"));
+                        canvas.drawRoundRect(obs.rect, 6, 6, paint);
+                    } else {
+                        paint.setColor(Color.parseColor("#FF0055"));
+                        canvas.drawRoundRect(obs.rect, 10, 10, paint);
+                    }
                 }
 
+                // Coins & Shields
                 paint.setColor(Color.parseColor("#F59E0B"));
                 for (RectF coin : coinItems) {
                     canvas.drawOval(coin, paint);
@@ -724,16 +893,18 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
                 paint.setColor(Color.parseColor("#10B981"));
                 for (RectF sh : shieldItems) {
-                    canvas.drawRoundRect(sh, 16, 16, paint);
+                    canvas.drawRoundRect(sh, 14, 14, paint);
                 }
 
+                // Particles
                 for (Particle pt : particles) {
                     paint.setColor(pt.color);
                     paint.setAlpha((int) (Math.max(0, pt.alpha) * 255));
-                    canvas.drawCircle(pt.x, pt.y, 5, paint);
+                    canvas.drawCircle(pt.x, pt.y, 5f, paint);
                 }
                 paint.setAlpha(255);
 
+                // Runner Character
                 boolean flashing = System.currentTimeMillis() < invulnerableUntil && ((System.currentTimeMillis() / 80) % 2 == 0);
                 paint.setColor(flashing ? Color.parseColor("#FF0055") : Color.parseColor("#00F0FF"));
                 canvas.drawRoundRect(new RectF(playerX, playerY, playerX + 46, playerY + 50), 10, 10, paint);
@@ -741,28 +912,50 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                 paint.setColor(Color.WHITE);
                 canvas.drawRect(playerX + 24, playerY + 12, playerX + 42, playerY + 20, paint);
 
-                textPaint.setColor(Color.parseColor("#94A3B8"));
-                textPaint.setTextSize(26);
-                canvas.drawText("LVL " + level, w - 150, 50, textPaint);
+                // Canvas HUD (Zero UI-thread overhead)
+                String shieldStr = shields == 3 ? "♥♥♥" : (shields == 2 ? "♥♥♡" : (shields == 1 ? "♥♡♡" : "♡♡♡"));
+                textPaint.setColor(Color.parseColor("#00F0FF"));
+                textPaint.setTextSize(24f);
+                canvas.drawText(String.format(Locale.US, "SCORE: %d  |  BEST: %d  |  COINS: %d (x%d)  |  SHIELDS: %s",
+                        score, highScore, coins, combo, shieldStr), 28f, h - 22f, textPaint);
 
-                if (isPaused) {
-                    canvas.drawColor(Color.argb(170, 8, 11, 17));
+                textPaint.setColor(Color.parseColor("#94A3B8"));
+                textPaint.setTextSize(20f);
+                canvas.drawText(String.format(Locale.US, "LVL %d  ·  %.0f FPS (%.1f ms)", level, currentFps, avgFrameTimeMs),
+                        w - 340f, h - 22f, textPaint);
+
+                if (inTitleMenu) {
+                    canvas.drawColor(Color.argb(190, 8, 11, 17));
                     textPaint.setColor(Color.parseColor("#00F0FF"));
-                    textPaint.setTextSize(48);
-                    canvas.drawText("GAME PAUSED — TAP TO RESUME", w / 2f - 360, h / 2f, textPaint);
-                } else if (isGameOver) {
-                    canvas.drawColor(Color.argb(200, 8, 11, 17));
-                    textPaint.setColor(Color.parseColor("#FF0055"));
-                    textPaint.setTextSize(54);
-                    canvas.drawText("RUN TERMINATED", w / 2f - 230, h / 2f - 50, textPaint);
+                    textPaint.setTextSize(50f);
+                    canvas.drawText("SCREAM RUNNER v3.0", w / 2f - 280f, h / 2f - 50f, textPaint);
 
                     textPaint.setColor(Color.WHITE);
-                    textPaint.setTextSize(34);
-                    canvas.drawText("FINAL SCORE: " + score + "   |   BEST: " + highScore + "   |   COINS: " + coins, w / 2f - 390, h / 2f + 15, textPaint);
+                    textPaint.setTextSize(26f);
+                    canvas.drawText("Touch Screen or Shout Above Gate to Jump & Double-Jump", w / 2f - 410f, h / 2f + 10f, textPaint);
+
+                    textPaint.setColor(Color.parseColor("#10B981"));
+                    textPaint.setTextSize(30f);
+                    canvas.drawText("[ TAP ANYWHERE TO START RUN ]", w / 2f - 260f, h / 2f + 75f, textPaint);
+                } else if (isPaused) {
+                    canvas.drawColor(Color.argb(175, 8, 11, 17));
+                    textPaint.setColor(Color.parseColor("#00F0FF"));
+                    textPaint.setTextSize(44f);
+                    canvas.drawText("GAME PAUSED — TAP TO RESUME", w / 2f - 350f, h / 2f, textPaint);
+                } else if (isGameOver) {
+                    canvas.drawColor(Color.argb(205, 8, 11, 17));
+                    textPaint.setColor(Color.parseColor("#FF0055"));
+                    textPaint.setTextSize(50f);
+                    canvas.drawText("RUN COMPLETE", w / 2f - 200f, h / 2f - 50f, textPaint);
+
+                    textPaint.setColor(Color.WHITE);
+                    textPaint.setTextSize(30f);
+                    canvas.drawText("FINAL SCORE: " + score + "   |   BEST: " + highScore + "   |   COINS: " + coins,
+                            w / 2f - 370f, h / 2f + 15f, textPaint);
 
                     textPaint.setColor(Color.parseColor("#00F0FF"));
-                    textPaint.setTextSize(32);
-                    canvas.drawText("[ TAP ANYWHERE TO PLAY AGAIN ]", w / 2f - 280, h / 2f + 80, textPaint);
+                    textPaint.setTextSize(28f);
+                    canvas.drawText("[ TAP ANYWHERE TO PLAY AGAIN ]", w / 2f - 260f, h / 2f + 75f, textPaint);
                 }
 
             } finally {
@@ -782,7 +975,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         public void resumeLoop() {
             if (isRunningLoop) return;
             isRunningLoop = true;
-            gameThread = new Thread(this);
+            gameThread = new Thread(this, "ScreamRunnerRenderThread");
             gameThread.start();
         }
 

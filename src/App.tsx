@@ -4,7 +4,7 @@ import { GameRunner } from './components/GameRunner';
 import { DashboardView } from './components/DashboardView';
 import { TestingSuite } from './components/TestingSuite';
 import { DownloadsView } from './components/DownloadsView';
-import { Download, ShieldCheck, Gamepad2, Terminal, Info, ExternalLink } from 'lucide-react';
+import { Download } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dual' | 'game' | 'dashboard' | 'testing' | 'downloads'>('dual');
@@ -84,33 +84,33 @@ export default function App() {
       <footer className="border-t border-slate-800/80 bg-[#06080D] px-6 py-4 text-xs text-slate-400">
         <div className="max-w-[1700px] mx-auto flex flex-wrap items-center justify-between gap-4 font-mono">
           <div className="flex items-center gap-3">
-            <span className="text-white font-semibold">DELIVERABLES READY</span>
+            <span className="text-white font-semibold">RELEASE v3.0 DELIVERABLES</span>
             <span>·</span>
             <a
-              href="/downloads/scream-runner-v2.5.0.apk"
-              download="scream-runner-v2.5.0.apk"
+              href="/downloads/scream-runner-v3.0.apk"
+              download="scream-runner-v3.0.apk"
               className="text-cyan-400 hover:underline flex items-center gap-1"
             >
               <Download className="w-3 h-3" />
-              scream-runner-v2.5.0.apk (1.13 MB)
+              scream-runner-v3.0.apk
             </a>
             <span>·</span>
             <a
-              href="/downloads/sams-dashboard-v2.5.0.apk"
-              download="sams-dashboard-v2.5.0.apk"
+              href="/downloads/sams-dashboard-v3.0.apk"
+              download="sams-dashboard-v3.0.apk"
               className="text-emerald-400 hover:underline flex items-center gap-1"
             >
               <Download className="w-3 h-3" />
-              sams-dashboard-v2.5.0.apk (1.13 MB)
+              sams-dashboard-v3.0.apk
             </a>
           </div>
 
           <div className="flex items-center gap-4 text-slate-500">
             <span>APK Signature v1/v2/v3: VERIFIED</span>
             <span>·</span>
-            <span>FastAPI SQLite WAL: ONLINE</span>
+            <span>FastAPI Argon2id + SQLite WAL: ONLINE</span>
             <span>·</span>
-            <span>Google WebAPK Ready</span>
+            <span>Android 14–16 Ready</span>
           </div>
         </div>
       </footer>
