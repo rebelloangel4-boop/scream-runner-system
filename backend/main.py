@@ -46,7 +46,9 @@ def load_or_generate_secret() -> str:
         pass
     return DEFAULT_ADMIN_PASS
 
-JWT_SECRET = os.environ.get("JWT_SECRET") or "sr_jwt_production_secret_key_2026_verified"
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET must be configured with at least 32 characters")
 JWT_ALGORITHM = "HS256"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = load_or_generate_secret()
@@ -133,8 +135,8 @@ def init_db():
     # Seed initial verified demo session if database has no sessions yet
     count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     conn.close()
-    if count == 0:
-        seed_demo_data()
+    # Never inject synthetic recordings into a production database.
+    # Test fixtures must be created explicitly in isolated test databases.
 
 def seed_demo_data() -> dict:
     conn = get_db_conn()
@@ -299,6 +301,8 @@ def verify_token(authorization: Optional[str] = Header(None)) -> dict:
         conn.close()
         if revoked:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
+        if payload.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Administrator access required")
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
@@ -340,12 +344,8 @@ def login(req: LoginRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
 
-    valid_passwords = {ADMIN_PASSWORD, DEFAULT_ADMIN_PASS}
-    if SECRET_FILE.exists():
-        try:
-            valid_passwords.add(SECRET_FILE.read_text().strip())
-        except Exception:
-            pass
+    # Only the explicitly configured administrator credential is accepted.
+    valid_passwords = {ADMIN_PASSWORD}
 
     # Check if valid credentials first (clears rate limit bucket for legitimate admin)
     if req.username == ADMIN_USERNAME and req.password in valid_passwords:
@@ -375,8 +375,18 @@ def login(req: LoginRequest, request: Request):
 
 @app.post("/api/v1/auth/refresh")
 def refresh_token_endpoint(req: RefreshRequest):
-    payload = verify_token(f"Bearer {req.refresh_token}")
-    username = payload.get("sub", ADMIN_USERNAME)
+    try:
+        payload = jwt.decode(req.refresh_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    conn = get_db_conn()
+    revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (payload.get("jti"),)).fetchone()
+    conn.close()
+    if revoked:
+        raise HTTPException(status_code=401, detail="Revoked refresh token")
+    if payload.get("role") != "refresh" or payload.get("sub") != ADMIN_USERNAME:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    username = payload["sub"]
     new_access_token = create_jwt_token(username, role="admin", expires_in_seconds=86400)
     return {
         "access_token": new_access_token,
