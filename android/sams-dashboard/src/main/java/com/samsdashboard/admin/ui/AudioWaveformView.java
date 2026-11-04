@@ -110,7 +110,7 @@ public class AudioWaveformView extends View {
         canvas.drawLine(playheadX, 0, playheadX, height, playheadPaint);
 
         // Draw Peak dB badge
-        String dbText = String.format(java.util.Locale.US, "Peak: %.1f dB", peakDb);
+        String dbText = String.format(java.util.Locale.US, "Peak: %.1f dBFS", peakDb);
         canvas.drawText(dbText, width - 180, 36, textPaint);
     }
 

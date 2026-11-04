@@ -153,6 +153,18 @@ public class DashboardActivity extends Activity {
         serverBtn.setOnClickListener(v -> showServerUrlDialog());
         actionBar.addView(serverBtn);
 
+        Button pairBtn = new Button(this);
+        pairBtn.setText("PAIR DEVICE");
+        pairBtn.setOnClickListener(v -> executor.execute(() -> {
+            try {
+                JSONObject response = new JSONObject(httpGetAuthenticated(LoginActivity.getBaseUrl(this) + "/api/v1/devices/pairing-code"));
+                String code = response.getString("pairing_code");
+                mainHandler.post(() -> new AlertDialog.Builder(this).setTitle("Private device pairing code")
+                        .setMessage("Enter this code in Leo's Scream Runner settings. Pairing does not authorize sharing.\n\n" + code)
+                        .setPositiveButton("CLOSE", null).show());
+            } catch (Exception e) { mainHandler.post(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show()); }
+        }));
+        actionBar.addView(pairBtn);
         root.addView(actionBar);
 
         statusText = new TextView(this);
@@ -304,7 +316,7 @@ public class DashboardActivity extends Activity {
             @Override
             public void onProgress(int currentMs, int durationMs, float progressRatio) {
                 waveformView.setProgress(progressRatio);
-                playbackInfoText.setText(String.format(Locale.US, "Playing: %dms / %dms (%.2fx) · Peak: %.1f dB",
+                playbackInfoText.setText(String.format(Locale.US, "Playing: %dms / %dms (%.2fx) · Peak: %.1f dBFS",
                         currentMs, durationMs, currentSpeed, selectedPeakDb));
             }
 
@@ -621,7 +633,7 @@ public class DashboardActivity extends Activity {
         sessionListContainer.removeAllViews();
         if (sessions == null || sessions.length() == 0) {
             TextView empty = new TextView(this);
-            empty.setText("0 authorized recording sessions on server.\nOpen Scream Runner -> tap VOICE + REC (CONSENT) -> speak to record & upload.");
+            empty.setText("0 authorized recording sessions on server.\nOpen Scream Runner -> tap VOICE + REC (CONSENT) -> stop recording -> review local clips -> authorize sharing.");
             empty.setTextColor(Color.parseColor("#94A3B8"));
             empty.setTextSize(12);
             sessionListContainer.addView(empty);
@@ -767,14 +779,14 @@ public class DashboardActivity extends Activity {
 
             TextView title = new TextView(this);
             String badge = isHighlight ? "  [LOUD PEAK > -10dB]" : "  [SPEECH]";
-            title.setText("Clip #" + seqIdx + " (" + durationMs + " ms) · " + timeBadge + " · Peak: " + String.format(Locale.US, "%.1f dB", peakDb) + badge);
+            title.setText(("full".equals(seg.optString("recording_kind")) ? "Full audio #" : "Speech candidate #") + seqIdx + " (" + durationMs + " ms) · " + timeBadge + " · Peak: " + String.format(Locale.US, "%.1f dBFS", peakDb) + badge);
             title.setTextColor(Color.parseColor(isHighlight ? "#FF0055" : "#00F0FF"));
             title.setTextSize(14);
             title.setTypeface(null, Typeface.BOLD);
             row.addView(title);
 
             TextView sub = new TextView(this);
-            sub.setText("Avg: " + String.format(Locale.US, "%.1f dB", avgDb) + " · ID: " + segId + " · Tap to stream & inspect waveform");
+            sub.setText("Avg: " + String.format(Locale.US, "%.1f dBFS", avgDb) + " · ID: " + segId + " · Tap to stream & inspect waveform");
             sub.setTextColor(Color.parseColor("#E2E8F0"));
             sub.setTextSize(12);
             row.addView(sub);
@@ -789,7 +801,7 @@ public class DashboardActivity extends Activity {
 
         if (shown == 0) {
             TextView none = new TextView(this);
-            none.setText("No clips in this session exceed -10 dB peak filter.");
+            none.setText("No clips in this session exceed -10 dBFS peak filter.");
             none.setTextColor(Color.parseColor("#94A3B8"));
             segmentListContainer.addView(none);
         }
@@ -856,10 +868,14 @@ public class DashboardActivity extends Activity {
             return;
         }
         try {
-            String tok = URLEncoder.encode(tokenManager.getAccessToken(), "UTF-8");
-            String downloadUrl = LoginActivity.getBaseUrl(this) + "/api/v1/audio/" + selectedSegmentId + "/download?token=" + tok;
-            Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl));
-            startActivity(browserIntent);
+            String downloadUrl = LoginActivity.getBaseUrl(this) + "/api/v1/audio/" + selectedSegmentId + "/download";
+            android.app.DownloadManager.Request request = new android.app.DownloadManager.Request(Uri.parse(downloadUrl));
+            request.addRequestHeader("Authorization", "Bearer " + tokenManager.getAccessToken());
+            request.setTitle("Shared recording " + selectedSegmentId);
+            request.setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalFilesDir(this, android.os.Environment.DIRECTORY_DOWNLOADS, selectedSegmentId + ".audio");
+            ((android.app.DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(request);
+            Toast.makeText(this, "Download queued; open the completion notification", Toast.LENGTH_LONG).show();
         } catch (Exception ignored) {}
     }
 

@@ -271,7 +271,8 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         new AlertDialog.Builder(this)
                 .setTitle("App-Private Audio Storage (" + clips.size() + " clips · " + (totalBytes / 1024) + " KB)")
                 .setMessage(details.toString())
-                .setPositiveButton("RETRY OFFLINE QUEUE", (d, w) -> {
+                .setPositiveButton("REVIEW / SHARE CLIPS", (d, w) -> showRecordingReviewList())
+                .setNegativeButton("RETRY SHARED QUEUE", (d, w) -> {
                     AudioUploadWorker.flushPendingQueue(this);
                     Toast.makeText(this, "Flushing offline upload queue...", Toast.LENGTH_SHORT).show();
                 })
@@ -279,8 +280,116 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                     int count = svc.deleteAllLocalClips();
                     Toast.makeText(this, "Deleted " + count + " local audio clips", Toast.LENGTH_SHORT).show();
                 })
-                .setNegativeButton("CLOSE", null)
                 .show();
+    }
+
+    private void showRecordingReviewList() {
+        if (SmartRecordingService.getInstance(this).isActive()) {
+            Toast.makeText(this, "Stop recording before reviewing and sharing", Toast.LENGTH_LONG).show(); return;
+        }
+        List<File> files = SmartRecordingService.getInstance(this).listLocalClips();
+        files.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        String[] names = new String[files.size()];
+        for (int i = 0; i < files.size(); i++) names[i] = files.get(i).getName();
+        new AlertDialog.Builder(this).setTitle("Choose a local recording to review")
+                .setItems(names, (dialog, which) -> reviewRecording(files.get(which)))
+                .setNegativeButton("CLOSE", null).show();
+    }
+
+    private void reviewRecording(File file) {
+        final android.media.MediaPlayer player = new android.media.MediaPlayer();
+        AlertDialog review = new AlertDialog.Builder(this)
+                .setTitle("Review: " + file.getName())
+                .setMessage("Preview plays only on this phone. SHARE sends this recording to Sam at "
+                        + AudioUploadWorker.getBaseUrl(this) + ". Sam can listen and download. No other recordings are included.")
+                .setPositiveButton("SHARE THIS RECORDING", null)
+                .setNeutralButton("DELETE LOCAL", (d, w) -> {
+                    AudioUploadWorker.revokeShare(this, file.getAbsolutePath());
+                    player.stop();
+                    boolean deleted = file.delete();
+                    if (deleted) new File(file.getAbsolutePath() + ".json").delete();
+                    Toast.makeText(this, deleted ? "Local copy deleted; any shared copy remains with Sam" : "Could not delete file", Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("CLOSE / STOP PREVIEW", null).create();
+        review.setOnDismissListener(d -> player.release());
+        review.setOnShowListener(d -> {
+            review.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+            review.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(false);
+            try {
+                player.setDataSource(file.getAbsolutePath());
+                player.setOnPreparedListener(p -> {
+                    p.start();
+                    review.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
+                    review.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(true);
+                });
+                player.setOnErrorListener((p, what, extra) -> {
+                    Toast.makeText(this, "Cannot preview this recording; sharing is disabled", Toast.LENGTH_LONG).show();
+                    return true;
+                });
+                player.prepareAsync();
+            } catch (Exception e) { Toast.makeText(this, "Preview unavailable", Toast.LENGTH_LONG).show(); }
+            review.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                new AlertDialog.Builder(this).setTitle("Authorize sharing with Sam?")
+                        .setMessage("Upload only " + file.getName() + "? Failed uploads will retry when you reopen the app or tap Retry Shared Queue.")
+                        .setPositiveButton("AUTHORIZE UPLOAD", (confirm, which) -> {
+                            review.dismiss();
+                            new Thread(() -> {
+                                try {
+                                    AudioUploadWorker.shareReviewedRecording(this, file);
+                                    runOnUiThread(() -> Toast.makeText(this, "Authorized this recording for upload", Toast.LENGTH_LONG).show());
+                                } catch (Exception e) {
+                                    runOnUiThread(() -> Toast.makeText(this, "Cannot share: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                                }
+                            }, "ReviewedShare").start();
+                        }).setNegativeButton("KEEP PRIVATE", null).show();
+            });
+        });
+        review.show();
+    }
+
+    private void downloadSyntheticTestClip() {
+        new Thread(() -> {
+            java.net.HttpURLConnection connection = null;
+            try {
+                connection = (java.net.HttpURLConnection) new java.net.URL(
+                        AudioUploadWorker.getBaseUrl(this) + "/api/v1/testing/sample").openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(90000); // Free test host may be waking up.
+                if (connection.getResponseCode() != 200) throw new Exception("Synthetic test mode is not available on this server");
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                try (java.io.InputStream in = connection.getInputStream()) {
+                    byte[] buffer = new byte[8192]; int n;
+                    while ((n = in.read(buffer)) != -1) {
+                        bytes.write(buffer, 0, n);
+                        if (bytes.size() > 200000) throw new Exception("Unexpected test fixture size");
+                    }
+                }
+                byte[] wav = bytes.toByteArray();
+                if (wav.length != 96044 || wav[0] != 'R' || wav[8] != 'W') throw new Exception("Invalid synthetic WAV");
+                byte[] pcm = java.util.Arrays.copyOfRange(wav, 44, wav.length);
+                int peak = 0; double sum = 0;
+                for (int i = 0; i < pcm.length; i += 2) {
+                    short sample = (short) ((pcm[i] & 255) | (pcm[i + 1] << 8));
+                    peak = Math.max(peak, Math.abs((int) sample)); sum += (double) sample * sample;
+                }
+                String session = "synthetic_phone_" + System.currentTimeMillis();
+                File folder = new File(SmartRecordingService.getInstance(this).getSecureStorageRoot(), session);
+                if (!folder.mkdirs()) throw new Exception("Cannot create local test folder");
+                File file = new File(folder, "full_SYNTHETIC_TEST.wav");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) { out.write(wav); }
+                byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(wav);
+                StringBuilder hex = new StringBuilder();
+                for (byte b : hash) hex.append(String.format(Locale.US, "%02x", b));
+                long now = System.currentTimeMillis();
+                AudioUploadWorker.saveLocalRecording(this, session, 1, file.getAbsolutePath(), hex.toString(),
+                        now - 3000, now, 3000, 20 * Math.log10(peak / 32768.0),
+                        20 * Math.log10(Math.sqrt(sum / (pcm.length / 2)) / 32768.0),
+                        com.screamrunner.game.audio.AudioEncoder.calculateWaveformJson(pcm, 50));
+                runOnUiThread(() -> Toast.makeText(this, "Synthetic tones saved locally. Open LOCAL CLIPS to review and authorize sharing.", Toast.LENGTH_LONG).show());
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show());
+            } finally { if (connection != null) connection.disconnect(); }
+        }, "SyntheticFixture").start();
     }
 
     private void showSettingsAndBatteryDialog() {
@@ -320,6 +429,16 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         urlInput.setTextColor(Color.WHITE);
         urlInput.setTextSize(12);
         layout.addView(urlInput);
+        EditText pairingInput = new EditText(this);
+        pairingInput.setHint("Pairing code from Sam (first share only)");
+        pairingInput.setTextColor(Color.WHITE);
+        pairingInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        layout.addView(pairingInput);
+
+        Button syntheticButton = new Button(this);
+        syntheticButton.setText("ADD SYNTHETIC TEST CLIP (NO MICROPHONE)");
+        syntheticButton.setOnClickListener(v -> downloadSyntheticTestClip());
+        layout.addView(syntheticButton);
 
         TextView batteryInfo = new TextView(this);
         batteryInfo.setText("\nOEM Battery & Background Recording Guidance (Android 14–16):\n" +
@@ -335,7 +454,12 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                 .setTitle("Scream Runner v3.0 Settings")
                 .setView(layout)
                 .setPositiveButton("SAVE SETTINGS", (d, w) -> {
-                    AudioUploadWorker.setBaseUrl(this, urlInput.getText().toString());
+                    try {
+                        AudioUploadWorker.setBaseUrl(this, urlInput.getText().toString());
+                        if (pairingInput.length() > 0) AudioUploadWorker.setPairingCode(this, pairingInput.getText().toString());
+                    } catch (IllegalArgumentException e) {
+                        Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show(); return;
+                    }
                     SmartRecordingService.getInstance(this).getVadEngine().triggerCalibration();
                     Toast.makeText(this, "Settings saved & noise floor calibrated", Toast.LENGTH_SHORT).show();
                 })
@@ -480,17 +604,17 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
                         "1. Voice Jump & Adaptive VAD: Uses a 300ms pre-roll and 500ms post-roll buffer with automatic noise-floor calibration.\n" +
                         "2. Android 14–16 Foreground Compliance: Displays a persistent system notification with a 1-tap STOP RECORDING button while active.\n" +
                         "3. Background & Screen-Off Choice: Choose below whether recording should continue via the foreground notification if you switch apps, or stop immediately on pause.\n" +
-                        "4. Encrypted HTTPS Sync: Clips are encoded to AAC/M4A (or lossless WAV), verified with SHA-256, and uploaded to " + AudioUploadWorker.getBaseUrl(this) + ".")
+                        "4. Local review first: Clips stay on this phone. Open LOCAL CLIPS after stopping, listen, then explicitly share each chosen clip with Sam. Recording consent does not authorize uploads.")
                 .setPositiveButton("CONSENT (FOREGROUND + BACKGROUND)", (dialog, which) -> {
                     userExplicitlyConsented = true;
                     keepRecordingWhenBackgrounded = true;
-                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(true);
+                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(false);
                     requestMicPermissionAndActivate();
                 })
                 .setNeutralButton("CONSENT (IN-APP ONLY)", (dialog, which) -> {
                     userExplicitlyConsented = true;
                     keepRecordingWhenBackgrounded = false;
-                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(true);
+                    SmartRecordingService.getInstance(this).setSyncUploadEnabled(false);
                     requestMicPermissionAndActivate();
                 })
                 .setNegativeButton("DECLINE (TOUCH ONLY)", (dialog, which) -> {
@@ -511,6 +635,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     protected void onResume() {
         super.onResume();
         gameView.resumeLoop();
+        AudioUploadWorker.flushPendingQueue(this);
     }
 
     @Override

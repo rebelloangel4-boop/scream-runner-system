@@ -77,7 +77,9 @@ public class AudioEncoder {
             boolean outputDone = false;
             int trackIndex = -1;
 
+            long deadline = android.os.SystemClock.elapsedRealtime() + 15000;
             while (!outputDone) {
+                if (android.os.SystemClock.elapsedRealtime() > deadline) throw new IOException("AAC encoder timed out");
                 if (!inputDone) {
                     int inIndex = codec.dequeueInputBuffer(10000);
                     if (inIndex >= 0) {
@@ -228,7 +230,7 @@ public class AudioEncoder {
             }
 
             double rms = (count > 0) ? Math.sqrt(sumSq / count) : 0;
-            double norm = Math.min(1.0, Math.max(0.04, rms / 32768.0));
+            double norm = Math.min(1.0, Math.max(0.0, rms / 32768.0));
             sb.append(String.format(Locale.US, "%.3f", norm));
             if (bar < numBars - 1) {
                 sb.append(",");

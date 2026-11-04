@@ -9,8 +9,8 @@ android {
         applicationId "com.sams.telemetry.console"
         minSdk 23
         targetSdk 34
-        versionCode 6
-        versionName "3.0.0"
+        versionCode 8
+        versionName "3.0.2-test"
     }
 
     buildTypes {
