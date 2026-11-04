@@ -347,6 +347,51 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         review.show();
     }
 
+    private void downloadSyntheticTestClip() {
+        new Thread(() -> {
+            java.net.HttpURLConnection connection = null;
+            try {
+                connection = (java.net.HttpURLConnection) new java.net.URL(
+                        AudioUploadWorker.getBaseUrl(this) + "/api/v1/testing/sample").openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(90000); // Free test host may be waking up.
+                if (connection.getResponseCode() != 200) throw new Exception("Synthetic test mode is not available on this server");
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                try (java.io.InputStream in = connection.getInputStream()) {
+                    byte[] buffer = new byte[8192]; int n;
+                    while ((n = in.read(buffer)) != -1) {
+                        bytes.write(buffer, 0, n);
+                        if (bytes.size() > 200000) throw new Exception("Unexpected test fixture size");
+                    }
+                }
+                byte[] wav = bytes.toByteArray();
+                if (wav.length != 96044 || wav[0] != 'R' || wav[8] != 'W') throw new Exception("Invalid synthetic WAV");
+                byte[] pcm = java.util.Arrays.copyOfRange(wav, 44, wav.length);
+                int peak = 0; double sum = 0;
+                for (int i = 0; i < pcm.length; i += 2) {
+                    short sample = (short) ((pcm[i] & 255) | (pcm[i + 1] << 8));
+                    peak = Math.max(peak, Math.abs((int) sample)); sum += (double) sample * sample;
+                }
+                String session = "synthetic_phone_" + System.currentTimeMillis();
+                File folder = new File(SmartRecordingService.getInstance(this).getSecureStorageRoot(), session);
+                if (!folder.mkdirs()) throw new Exception("Cannot create local test folder");
+                File file = new File(folder, "full_SYNTHETIC_TEST.wav");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) { out.write(wav); }
+                byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(wav);
+                StringBuilder hex = new StringBuilder();
+                for (byte b : hash) hex.append(String.format(Locale.US, "%02x", b));
+                long now = System.currentTimeMillis();
+                AudioUploadWorker.saveLocalRecording(this, session, 1, file.getAbsolutePath(), hex.toString(),
+                        now - 3000, now, 3000, 20 * Math.log10(peak / 32768.0),
+                        20 * Math.log10(Math.sqrt(sum / (pcm.length / 2)) / 32768.0),
+                        com.screamrunner.game.audio.AudioEncoder.calculateWaveformJson(pcm, 50));
+                runOnUiThread(() -> Toast.makeText(this, "Synthetic tones saved locally. Open LOCAL CLIPS to review and authorize sharing.", Toast.LENGTH_LONG).show());
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show());
+            } finally { if (connection != null) connection.disconnect(); }
+        }, "SyntheticFixture").start();
+    }
+
     private void showSettingsAndBatteryDialog() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -389,6 +434,11 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         pairingInput.setTextColor(Color.WHITE);
         pairingInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         layout.addView(pairingInput);
+
+        Button syntheticButton = new Button(this);
+        syntheticButton.setText("ADD SYNTHETIC TEST CLIP (NO MICROPHONE)");
+        syntheticButton.setOnClickListener(v -> downloadSyntheticTestClip());
+        layout.addView(syntheticButton);
 
         TextView batteryInfo = new TextView(this);
         batteryInfo.setText("\nOEM Battery & Background Recording Guidance (Android 14–16):\n" +

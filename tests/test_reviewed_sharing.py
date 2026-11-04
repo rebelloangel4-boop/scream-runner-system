@@ -115,6 +115,15 @@ class ReviewedSharingTests(unittest.TestCase):
         rows = self.client.get(f'/api/v1/sessions/{session}/segments',headers=self.admin).json()['segments']
         self.assertEqual(rows[0]['recording_kind'],'full')
 
+    def test_synthetic_only_mode_rejects_other_audio(self):
+        os.environ['SYNTHETIC_TEST_ONLY'] = '1'
+        try:
+            self.assertEqual(self.upload().status_code,403)
+            self.assertEqual(self.client.get('/api/v1/testing/sample').status_code,200)
+            self.assertEqual(self.client.post('/api/v1/storage/restore', headers=self.admin, json={}).status_code,403)
+        finally:
+            os.environ.pop('SYNTHETIC_TEST_ONLY',None)
+
     def test_hash_mismatch_rejected(self):
         self.assertEqual(self.upload(extra={'file_hash':'0'*64}).status_code,400)
 

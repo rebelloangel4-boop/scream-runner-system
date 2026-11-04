@@ -1047,6 +1047,10 @@ async def upload_audio_segment(
         raise HTTPException(status_code=413, detail="Uploaded audio file exceeds 25 MB limit")
 
     computed_hash = hashlib.sha256(contents).hexdigest()
+    if os.environ.get("SYNTHETIC_TEST_ONLY") == "1":
+        from backend.synthetic_fixture import synthetic_wav
+        if not hmac.compare_digest(computed_hash, hashlib.sha256(synthetic_wav()).hexdigest()):
+            raise HTTPException(status_code=403, detail="Temporary test deployment accepts only its synthetic test clip; private recordings are blocked")
     if file_hash and file_hash.strip().lower() != computed_hash.lower():
         raise HTTPException(status_code=400, detail="SHA-256 integrity verification failed")
 
@@ -1370,6 +1374,8 @@ def export_portable_backup(include_audio_base64: bool = True, auth: dict = Depen
 
 @app.post("/api/v1/storage/restore")
 def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(verify_admin_token)):
+    if os.environ.get("SYNTHETIC_TEST_ONLY") == "1":
+        raise HTTPException(status_code=403, detail="Backup import disabled on synthetic-only test deployment")
     """Restores devices, sessions, and audio files from a portable backup snapshot."""
     conn = get_db_conn()
     conn.execute("PRAGMA foreign_keys=OFF;")
@@ -1549,3 +1555,13 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8001"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+
+@app.get("/api/v1/testing/sample")
+def synthetic_test_sample():
+    if os.environ.get("SYNTHETIC_TEST_ONLY") != "1":
+        raise HTTPException(status_code=404, detail="Test mode is disabled")
+    from backend.synthetic_fixture import synthetic_wav
+    return Response(synthetic_wav(), media_type="audio/wav", headers={
+        "Content-Disposition": 'attachment; filename="synthetic_test.wav"',
+        "Cache-Control": "no-store"})

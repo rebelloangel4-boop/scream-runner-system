@@ -9,8 +9,8 @@ android {
         applicationId "com.screamrunner.arcade"
         minSdk 23
         targetSdk 34
-        versionCode 7
-        versionName "3.0.1-review"
+        versionCode 8
+        versionName "3.0.2-test"
     }
 
     buildTypes {
