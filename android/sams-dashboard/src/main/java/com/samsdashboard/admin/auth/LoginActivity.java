@@ -232,7 +232,7 @@ public class LoginActivity extends Activity {
                 conn.setReadTimeout(10000);
                 int code = conn.getResponseCode();
                 if (code >= 200 && code < 300) {
-                    JSONObject json = new JSONObject(readStream(conn.getInputStream()));
+                    JSONObject json = parseJsonResponse(conn);
                     final boolean setupReq = json.optBoolean("setup_required", false);
                     final String algo = json.optString("hash_algorithm", "argon2id");
                     final String adminUser = json.optString("admin_username", "admin");
@@ -318,7 +318,7 @@ public class LoginActivity extends Activity {
 
                 int code = conn.getResponseCode();
                 if (code >= 200 && code < 300) {
-                    JSONObject json = new JSONObject(readStream(conn.getInputStream()));
+                    JSONObject json = parseJsonResponse(conn);
                     String accessToken = json.optString("access_token", "");
                     String refreshToken = json.optString("refresh_token", "");
                     final String oneTimeRecoveryKey = json.optString("recovery_key", "");
@@ -385,6 +385,24 @@ public class LoginActivity extends Activity {
         intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         startActivity(intent);
         finish();
+    }
+
+    private static JSONObject parseJsonResponse(HttpURLConnection conn) throws Exception {
+        int code = conn.getResponseCode();
+        String contentType = conn.getContentType();
+        if (code < 200 || code >= 300) {
+            throw new java.io.IOException("Server returned HTTP " + code);
+        }
+        if (contentType == null || !contentType.toLowerCase(java.util.Locale.ROOT).contains("application/json")) {
+            throw new java.io.IOException("Server returned " + (contentType == null ? "an unknown content type" : contentType)
+                    + " instead of JSON. Verify the backend URL and deployment.");
+        }
+        String body = readStream(conn.getInputStream());
+        try {
+            return new JSONObject(body);
+        } catch (org.json.JSONException e) {
+            throw new java.io.IOException("Server returned invalid JSON. Verify the backend URL and deployment.", e);
+        }
     }
 
     private static String readStream(InputStream in) throws Exception {
