@@ -50,8 +50,10 @@ for keeping private recordings, admin accounts, and pairing tokens reliably.
 
 ## Known limits
 These APKs are debug test builds. Automated backend tests do not establish real-device
-microphone/codec behavior or six-hour reliability. Existing recording is VAD-based:
-it saves speech clips, not a gap-free six-hour master recording. Speech detection is
+microphone/codec behavior or six-hour reliability. The recorder now retains all received PCM in 30-second full_* segments as well as
+existing speech_* highlight clips, and stops at six hours. These are separate
+reviewable files, not a merged six-hour master. Device interruptions can create gaps;
+force-stop can lose the current incomplete segment. Speech detection is
 heuristic; the app no longer sends a fabricated probability. This patch preserves the
 existing game, encoder, VAD, player, waveform, filters, and retry components.
 

@@ -212,6 +212,10 @@ def init_db():
         );
         """)
 
+        segment_cols = [r["name"] for r in conn.execute("PRAGMA table_info(audio_segments)").fetchall()]
+        if "recording_kind" not in segment_cols:
+            conn.execute("ALTER TABLE audio_segments ADD COLUMN recording_kind TEXT NOT NULL DEFAULT 'speech'")
+
         # Apply v3 migration columns safely if upgrading from v2.x database
         existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()]
         if "os_version" not in existing_cols:
@@ -1016,12 +1020,15 @@ async def upload_audio_segment(
     avg_db: float = Form(...),
     speech_confidence: float = Form(0.0),
     sharing_authorized: bool = Form(False),
+    recording_kind: str = Form("speech"),
     file_hash: Optional[str] = Form(None),
     waveform_json: Optional[str] = Form(None),
     device_id: Optional[str] = Form(None),
     device_name: Optional[str] = Form(None),
     actor: dict = Depends(verify_device_or_admin)
 ):
+    if recording_kind not in ("full", "speech"):
+        raise HTTPException(status_code=400, detail="Invalid recording kind")
     if not sharing_authorized:
         raise HTTPException(status_code=403, detail="Review and explicit sharing authorization are required")
     resolved_device_id = device_id or actor.get("device_id")
@@ -1115,6 +1122,7 @@ async def upload_audio_segment(
         peak_db, avg_db, speech_confidence, str(dest_path), final_hash, len(contents),
         now, final_waveform
     ))
+    conn.execute("UPDATE audio_segments SET recording_kind = ? WHERE id = ?", (recording_kind, segment_id))
     conn.execute("UPDATE sessions SET total_speech_segments = total_speech_segments + 1 WHERE id = ?", (safe_session_id,))
 
     is_highlight = peak_db > -10.0
@@ -1156,7 +1164,7 @@ def get_session_segments(session_id: str, auth: dict = Depends(verify_admin_toke
     conn = get_db_conn()
     rows = conn.execute("""
         SELECT id, session_id, seq_index, start_time, end_time, duration_ms,
-               peak_db, avg_db, speech_confidence, file_hash, file_size_bytes, created_at, waveform_data
+               peak_db, avg_db, speech_confidence, file_hash, file_size_bytes, created_at, waveform_data, recording_kind
         FROM audio_segments
         WHERE session_id = ?
         ORDER BY seq_index ASC, created_at ASC

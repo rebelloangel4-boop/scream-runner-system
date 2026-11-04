@@ -109,6 +109,12 @@ class ReviewedSharingTests(unittest.TestCase):
         self.assertEqual(first.json()['segment_id'], second.json()['segment_id'])
         self.assertEqual(second.json()['status'],'already_exists')
 
+    def test_full_recording_metadata_is_preserved(self):
+        session = 'session_' + secrets.token_hex(6)
+        self.assertEqual(self.upload(session=session, extra={'recording_kind':'full'}).status_code,200)
+        rows = self.client.get(f'/api/v1/sessions/{session}/segments',headers=self.admin).json()['segments']
+        self.assertEqual(rows[0]['recording_kind'],'full')
+
     def test_hash_mismatch_rejected(self):
         self.assertEqual(self.upload(extra={'file_hash':'0'*64}).status_code,400)
 

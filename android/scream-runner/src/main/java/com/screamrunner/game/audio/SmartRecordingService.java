@@ -57,7 +57,15 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     private String sessionId;
     private OfflineVadEngine vadEngine;
     private final AtomicInteger sequenceIndex = new AtomicInteger(1);
-    private boolean isServiceActive = false;
+    private volatile boolean isServiceActive = false;
+    private final java.io.ByteArrayOutputStream fullRecordingPcm = new java.io.ByteArrayOutputStream();
+    private long fullSegmentStartedAtMs;
+    private final java.util.concurrent.ExecutorService encodingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final Runnable sessionLimit = () -> {
+        stopSession();
+        CoordinatedAudioManager.getInstance().stopCapture();
+        stopSelf();
+    };
     // Recording permission never grants sharing permission. Each saved clip is reviewed separately.
     private boolean syncUploadEnabled = false;
     private volatile double latestMeasuredDb = -60.0;
@@ -160,6 +168,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     @Override
     public void onDestroy() {
         stopSession();
+        encodingExecutor.shutdown();
         instance = null;
         super.onDestroy();
     }
@@ -208,6 +217,8 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         if (isServiceActive) return;
         isServiceActive = true;
         sequenceIndex.set(1);
+        fullSegmentStartedAtMs = System.currentTimeMillis();
+        heartbeatHandler.postDelayed(sessionLimit, 6L * 60 * 60 * 1000);
         vadEngine.triggerCalibration();
 
         enforceLocalRetentionPolicy();
@@ -250,7 +261,9 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         isServiceActive = false;
 
         heartbeatHandler.removeCallbacks(heartbeatRunnable);
+        heartbeatHandler.removeCallbacks(sessionLimit);
         CoordinatedAudioManager.getInstance().unregisterRecordingListener(this);
+        flushFullRecording();
 
         if (audioManager != null) {
             try {
@@ -302,7 +315,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
 
             builder.setSmallIcon(android.R.drawable.ic_btn_speak_now)
                     .setContentTitle("Scream Runner: Microphone Active")
-                    .setContentText("Authorized VAD (300ms pre-roll / 500ms post-roll). Tap STOP to end.")
+                    .setContentText("Recording locally (maximum 6 hours). Tap STOP to end; review before sharing.")
                     .setContentIntent(pendingOpen)
                     .addAction(android.R.drawable.ic_media_pause, "STOP RECORDING", pendingStop)
                     .setOngoing(true);
@@ -411,7 +424,26 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     public void onAudioFrame(short[] buffer, int readSamples, double measuredDb) {
         latestMeasuredDb = measuredDb;
         if (isServiceActive) {
+            synchronized (fullRecordingPcm) {
+                for (int i = 0; i < readSamples; i++) {
+                    fullRecordingPcm.write(buffer[i] & 255);
+                    fullRecordingPcm.write((buffer[i] >> 8) & 255);
+                }
+                if (fullRecordingPcm.size() >= 16000 * 2 * 30) flushFullRecording();
+            }
             vadEngine.processFrame(buffer, readSamples, measuredDb);
+        }
+    }
+
+    private void flushFullRecording() {
+        synchronized (fullRecordingPcm) {
+            if (fullRecordingPcm.size() == 0) return;
+            byte[] pcm = fullRecordingPcm.toByteArray();
+            long start = fullSegmentStartedAtMs;
+            long end = start + pcm.length * 1000L / 32000;
+            fullRecordingPcm.reset();
+            fullSegmentStartedAtMs = end;
+            queueEncoding(pcm, start, end, "full_");
         }
     }
 
@@ -422,7 +454,17 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
 
     @Override
     public void onSpeechCompleted(byte[] pcmData, long startTimeMs, long endTimeMs, double peakDb, double avgDb) {
+        queueEncoding(pcmData, startTimeMs, endTimeMs, "speech_");
+    }
+
+    private void queueEncoding(byte[] pcmData, long startTimeMs, long endTimeMs, String kind) {
         int seq = sequenceIndex.getAndIncrement();
+        String savedSessionId = sessionId;
+        encodingExecutor.execute(() -> saveEncodedSegment(pcmData, startTimeMs, endTimeMs, seq, kind, savedSessionId));
+    }
+
+    private void saveEncodedSegment(byte[] pcmData, long startTimeMs, long endTimeMs, int seq, String kind, String savedSessionId) {
+        double peakDb, avgDb;
         double sumSquares = 0; int peakAmplitude = 0;
         for (int i = 0; i + 1 < pcmData.length; i += 2) {
             short value = (short) ((pcmData[i] & 255) | (pcmData[i + 1] << 8));
@@ -433,13 +475,13 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         double rms = Math.sqrt(sumSquares / Math.max(1, pcmData.length / 2));
         avgDb = rms == 0 ? -96 : Math.max(-96, 20 * Math.log10(rms / 32768.0));
         try {
-            String activeSess = (sessionId != null) ? sessionId : "sess_android_default";
+            String activeSess = (savedSessionId != null) ? savedSessionId : "sess_android_default";
             File storageDir = new File(getSecureStorageRoot(), activeSess);
             if (!storageDir.exists()) {
                 storageDir.mkdirs();
             }
 
-            String baseName = "seg_" + seq + "_" + System.currentTimeMillis();
+            String baseName = kind + seq + "_" + startTimeMs;
             AudioEncoder.EncodedAudio encoded = AudioEncoder.encodeToM4aOrWav(pcmData, storageDir, baseName, 16000);
 
             if (appContext != null) {

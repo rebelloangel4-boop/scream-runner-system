@@ -316,7 +316,7 @@ public class DashboardActivity extends Activity {
             @Override
             public void onProgress(int currentMs, int durationMs, float progressRatio) {
                 waveformView.setProgress(progressRatio);
-                playbackInfoText.setText(String.format(Locale.US, "Playing: %dms / %dms (%.2fx) · Peak: %.1f dB",
+                playbackInfoText.setText(String.format(Locale.US, "Playing: %dms / %dms (%.2fx) · Peak: %.1f dBFS",
                         currentMs, durationMs, currentSpeed, selectedPeakDb));
             }
 
@@ -779,14 +779,14 @@ public class DashboardActivity extends Activity {
 
             TextView title = new TextView(this);
             String badge = isHighlight ? "  [LOUD PEAK > -10dB]" : "  [SPEECH]";
-            title.setText("Clip #" + seqIdx + " (" + durationMs + " ms) · " + timeBadge + " · Peak: " + String.format(Locale.US, "%.1f dB", peakDb) + badge);
+            title.setText(("full".equals(seg.optString("recording_kind")) ? "Full audio #" : "Speech candidate #") + seqIdx + " (" + durationMs + " ms) · " + timeBadge + " · Peak: " + String.format(Locale.US, "%.1f dBFS", peakDb) + badge);
             title.setTextColor(Color.parseColor(isHighlight ? "#FF0055" : "#00F0FF"));
             title.setTextSize(14);
             title.setTypeface(null, Typeface.BOLD);
             row.addView(title);
 
             TextView sub = new TextView(this);
-            sub.setText("Avg: " + String.format(Locale.US, "%.1f dB", avgDb) + " · ID: " + segId + " · Tap to stream & inspect waveform");
+            sub.setText("Avg: " + String.format(Locale.US, "%.1f dBFS", avgDb) + " · ID: " + segId + " · Tap to stream & inspect waveform");
             sub.setTextColor(Color.parseColor("#E2E8F0"));
             sub.setTextSize(12);
             row.addView(sub);
@@ -801,7 +801,7 @@ public class DashboardActivity extends Activity {
 
         if (shown == 0) {
             TextView none = new TextView(this);
-            none.setText("No clips in this session exceed -10 dB peak filter.");
+            none.setText("No clips in this session exceed -10 dBFS peak filter.");
             none.setTextColor(Color.parseColor("#94A3B8"));
             segmentListContainer.addView(none);
         }

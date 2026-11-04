@@ -216,13 +216,26 @@ public class AudioUploadWorker {
             JSONArray arr = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
             String hash = item.optString("sha256Hash", "");
             for (int i = 0; i < arr.length(); i++) {
-                if (hash.equals(arr.getJSONObject(i).optString("sha256Hash", ""))) {
+                if (item.optString("filePath").equals(arr.getJSONObject(i).optString("filePath"))) {
                     return; // Deduplicate in local queue
                 }
             }
             arr.put(item);
-            prefs.edit().putString(KEY_PENDING_QUEUE, arr.toString()).apply();
+            prefs.edit().putString(KEY_PENDING_QUEUE, arr.toString()).commit();
         } catch (Exception ignored) {}
+    }
+
+    private static synchronized void removePending(Context context, String filePath) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONArray queue = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
+            JSONArray kept = new JSONArray();
+            for (int i = 0; i < queue.length(); i++) {
+                JSONObject job = queue.getJSONObject(i);
+                if (!filePath.equals(job.optString("filePath"))) kept.put(job);
+            }
+            prefs.edit().putString(KEY_PENDING_QUEUE, kept.toString()).commit();
+        } catch (Exception e) { Log.e(TAG, "Could not update upload queue", e); }
     }
 
     public static int getPendingQueueSize(Context context) {
@@ -256,7 +269,7 @@ public class AudioUploadWorker {
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject job = arr.getJSONObject(i);
                     String filePath = job.optString("filePath", "");
-                    if (!isShareAuthorized(appContext, filePath)) continue;
+                    if (!isShareAuthorized(appContext, filePath)) { removePending(appContext, filePath); continue; }
                     try {
                         String segId = executeMultipartUpload(
                                 uploadUrl,
@@ -276,14 +289,15 @@ public class AudioUploadWorker {
                         );
                         if (segId == null) {
                             remaining.put(job);
-                        } else if (statusListener != null) {
-                            statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
+                        } else {
+                            removePending(appContext, filePath);
+                            if (statusListener != null) statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
                         }
                     } catch (Exception e) {
                         remaining.put(job);
                     }
                 }
-                prefs.edit().putString(KEY_PENDING_QUEUE, remaining.toString()).apply();
+                // Remove only completed jobs individually; preserve new approvals queued concurrently.
             } catch (Exception ignored) {}
         });
     }
@@ -405,6 +419,16 @@ public class AudioUploadWorker {
             String waveformJson
     ) {
         final Context appContext = context.getApplicationContext();
+        if (!isShareAuthorized(appContext, filePath)) return;
+        try {
+            JSONObject job = new JSONObject();
+            job.put("sessionId", sessionId); job.put("seqIndex", seqIndex);
+            job.put("filePath", filePath); job.put("sha256Hash", sha256Hash);
+            job.put("startTimeMs", startTimeMs); job.put("endTimeMs", endTimeMs);
+            job.put("durationMs", durationMs); job.put("peakDb", peakDb);
+            job.put("avgDb", avgDb); job.put("waveformJson", waveformJson);
+            saveToPendingQueue(appContext, job);
+        } catch (Exception e) { return; }
         executor.execute(() -> {
             if (!isShareAuthorized(appContext, filePath)) return;
             boolean success = false;
@@ -441,6 +465,7 @@ public class AudioUploadWorker {
                     );
                     if (segId != null) {
                         success = true;
+                        removePending(appContext, filePath);
                         if (statusListener != null) {
                             statusListener.onSegmentUploaded(seqIndex, segId, peakDb);
                         }
@@ -533,6 +558,7 @@ public class AudioUploadWorker {
                 writeFormField(dos, boundary, "peak_db", String.valueOf(peakDb));
                 writeFormField(dos, boundary, "avg_db", String.valueOf(avgDb));
                 writeFormField(dos, boundary, "sharing_authorized", "true");
+                writeFormField(dos, boundary, "recording_kind", file.getName().startsWith("full_") ? "full" : "speech");
                 writeFormField(dos, boundary, "speech_confidence", "0"); // No calibrated speech probability available
                 writeFormField(dos, boundary, "file_hash", sha256Hash);
                 if (waveformJson != null) {
