@@ -32,8 +32,9 @@ Remove ADMIN_SETUP_TOKEN after setup. Use PAIR DEVICE to display the private pai
 code; enter it with the same HTTPS URL in Scream Runner settings. Pairing permits
 only authenticated uploads; recording review and per-file sharing remain required.
 
-No new cloud service is provisioned by this patch. Ephemeral storage is unsuitable
-for keeping private recordings, admin accounts, and pairing tokens reliably.
+A synthetic-only temporary free deployment is documented in TEMPORARY_TEST_DEPLOYMENT.md.
+Ephemeral storage is unsuitable for retaining private recordings. Use that deployment
+only with its provided synthetic fixture, never with microphone recordings.
 
 ## Phone acceptance checks (not yet verified on hardware)
 1. Start recording explicitly. Verify the microphone indicator and STOP notification.
