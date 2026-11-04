@@ -48,7 +48,7 @@ public class LoginActivity extends Activity {
 
     private static final String PREFS_SERVER = "sams_dashboard_server_prefs_v3";
     private static final String KEY_BASE_URL = "backend_base_url";
-    public static final String DEFAULT_CLOUD_URL = "https://ais-pre-3fyydrqqukwg2upmm34wb7-344668128828.asia-northeast1.run.app";
+    public static final String DEFAULT_CLOUD_URL = "https://scream-runner-synthetic-test.onrender.com";
 
     private TextView diagStatusText;
     private TextView modeSubtitleText;

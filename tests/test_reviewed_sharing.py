@@ -124,6 +124,14 @@ class ReviewedSharingTests(unittest.TestCase):
         finally:
             os.environ.pop('SYNTHETIC_TEST_ONLY',None)
 
+    def test_storage_reset_invalidates_old_tokens(self):
+        previous = main.AUTH_EPOCH
+        try:
+            main.AUTH_EPOCH = secrets.token_hex(32)
+            self.assertEqual(self.client.get('/api/v1/sessions', headers=self.admin).status_code,401)
+        finally:
+            main.AUTH_EPOCH = previous
+
     def test_hash_mismatch_rejected(self):
         self.assertEqual(self.upload(extra={'file_hash':'0'*64}).status_code,400)
 

@@ -73,6 +73,13 @@ def load_or_create_jwt_secret() -> str:
 
 
 JWT_SECRET = load_or_create_jwt_secret()
+# Scope JWTs to this database generation. Ephemeral restarts must not resurrect revoked tokens.
+AUTH_EPOCH_FILE = STORAGE_DIR / ".auth_epoch"
+if not AUTH_EPOCH_FILE.exists():
+    AUTH_EPOCH_FILE.write_text(secrets.token_hex(32))
+    os.chmod(AUTH_EPOCH_FILE, 0o600)
+AUTH_EPOCH = AUTH_EPOCH_FILE.read_text().strip()
+INSTANCE_ID = uuid.uuid4().hex
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL_SEC = 3600       # 1 hour short-lived access token
 REFRESH_TOKEN_TTL_SEC = 604800    # 7 days refresh token
@@ -320,6 +327,7 @@ def create_jwt_token(subject: str, role: str = "admin", token_type: str = "acces
         "role": role,
         "type": token_type,
         "jti": jti,
+        "auth_epoch": AUTH_EPOCH,
         "iat": now,
         "exp": now + expires_in_seconds
     }
@@ -334,6 +342,8 @@ def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expec
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
 
+    if payload.get("auth_epoch") != AUTH_EPOCH:
+        raise HTTPException(status_code=401, detail="Server storage reset; sign in again")
     if payload.get("type") != expected_type:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1540,6 +1550,8 @@ def health_check():
     latency_ms = round((time.time() - start) * 1000, 2)
     return {
         "status": "healthy",
+        "instance_id": INSTANCE_ID,
+        "synthetic_test_only": os.environ.get("SYNTHETIC_TEST_ONLY") == "1",
         "version": "3.0.0",
         "db_latency_ms": latency_ms,
         "uptime": time.time(),

@@ -34,7 +34,7 @@ public class AudioUploadWorker {
     private static final String KEY_DEVICE_ID = "registered_device_id";
     private static final String KEY_DEVICE_TOKEN = "registered_device_token";
     private static final String KEY_PENDING_QUEUE = "pending_upload_queue_json";
-    public static final String DEFAULT_CLOUD_URL = "https://ais-pre-3fyydrqqukwg2upmm34wb7-344668128828.asia-northeast1.run.app";
+    public static final String DEFAULT_CLOUD_URL = "https://scream-runner-synthetic-test.onrender.com";
 
     private static final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -294,6 +294,11 @@ public class AudioUploadWorker {
                             if (statusListener != null) statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
                         }
                     } catch (Exception e) {
+                        if ("HTTP 401".equals(e.getMessage())) {
+                            prefs.edit().remove(KEY_DEVICE_TOKEN).commit();
+                            deviceToken = ensureDeviceEnrolledSync(appContext);
+                            deviceId = getOrInitDeviceId(appContext);
+                        }
                         remaining.put(job);
                     }
                 }
@@ -471,6 +476,11 @@ public class AudioUploadWorker {
                         }
                     }
                 } catch (Exception e) {
+                    if ("HTTP 401".equals(e.getMessage())) {
+                        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().remove(KEY_DEVICE_TOKEN).commit();
+                        deviceToken = ensureDeviceEnrolledSync(appContext);
+                        deviceId = getOrInitDeviceId(appContext);
+                    }
                     if (attempt == maxAttempts) {
                         try {
                             JSONObject job = new JSONObject();
