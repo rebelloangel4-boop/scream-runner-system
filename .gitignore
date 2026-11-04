@@ -14,3 +14,8 @@ backend/storage/*.db-shm
 backend/storage/*.db-wal
 !android/gradle/wrapper/gradle-wrapper.jar
 !public/downloads/*.apk
+
+# Never commit runtime recordings, backups or live databases
+backend/storage/
+*.jks
+*.keystore
