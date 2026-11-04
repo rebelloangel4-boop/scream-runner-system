@@ -19,3 +19,7 @@ backend/storage/*.db-wal
 backend/storage/
 *.jks
 *.keystore
+
+__pycache__/
+*.py[cod]
+backend/private_storage/

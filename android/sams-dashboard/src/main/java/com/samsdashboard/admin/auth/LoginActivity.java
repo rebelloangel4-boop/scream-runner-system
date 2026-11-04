@@ -199,12 +199,15 @@ public class LoginActivity extends Activity {
     private void updateUiMode() {
         if (isSetupRequired) {
             modeSubtitleText.setText("First-Time Administrator Setup (Argon2id)");
-            etRecoveryKey.setVisibility(View.GONE);
+            etRecoveryKey.setVisibility(View.VISIBLE);
+            etRecoveryKey.setHint("Private deployment setup token");
+            etRecoveryKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
             etPassword.setHint("Create strong password (min 8 chars)");
             btnPrimaryAction.setText("CREATE ADMIN ACCOUNT");
             btnToggleResetMode.setVisibility(View.GONE);
         } else if (isResetMode) {
             modeSubtitleText.setText("Reset Password via Deployment Recovery Key");
+            etRecoveryKey.setHint("Deployment Recovery Key");
             etRecoveryKey.setVisibility(View.VISIBLE);
             etPassword.setHint("Enter new password (min 8 chars)");
             btnPrimaryAction.setText("RESET PASSWORD & SIGN IN");
@@ -309,6 +312,7 @@ public class LoginActivity extends Activity {
                 conn.setReadTimeout(12000);
                 conn.setDoOutput(true);
                 conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                if (isSetupRequired) conn.setRequestProperty("X-Setup-Token", recoveryKey);
                 conn.setFixedLengthStreamingMode(bodyBytes.length);
 
                 try (OutputStream os = conn.getOutputStream()) {

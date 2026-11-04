@@ -58,7 +58,8 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     private OfflineVadEngine vadEngine;
     private final AtomicInteger sequenceIndex = new AtomicInteger(1);
     private boolean isServiceActive = false;
-    private boolean syncUploadEnabled = true;
+    // Recording permission never grants sharing permission. Each saved clip is reviewed separately.
+    private boolean syncUploadEnabled = false;
     private volatile double latestMeasuredDb = -60.0;
     private long interruptionStartedAtMs = 0;
 
@@ -124,9 +125,10 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
                 stopSelf();
                 return START_NOT_STICKY;
             }
+            if (!ACTION_START_SESSION.equals(action)) { stopSelf(); return START_NOT_STICKY; }
             String incomingId = intent.getStringExtra(EXTRA_SESSION_ID);
             if (intent.hasExtra(EXTRA_SYNC_ENABLED)) {
-                syncUploadEnabled = intent.getBooleanExtra(EXTRA_SYNC_ENABLED, true);
+                syncUploadEnabled = false;
             }
             Notification notif = buildForegroundNotification();
             if (notif != null) {
@@ -138,7 +140,12 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
                     }
                 } catch (Exception e) {
                     Log.w(TAG, "Foreground service promotion notice: " + e.getMessage());
+                    stopSelf();
+                    return START_NOT_STICKY;
                 }
+            } else {
+                stopSelf();
+                return START_NOT_STICKY;
             }
             startSessionInternal(incomingId);
         }
@@ -153,11 +160,12 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     @Override
     public void onDestroy() {
         stopSession();
+        instance = null;
         super.onDestroy();
     }
 
     public void setSyncUploadEnabled(boolean enabled) {
-        this.syncUploadEnabled = enabled;
+        this.syncUploadEnabled = false;
     }
 
     public boolean isSyncUploadEnabled() {
@@ -188,7 +196,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
                 Log.w(TAG, "Direct session start fallback: " + e.getMessage());
             }
         }
-        startSessionInternal(incomingSessionId);
+        // Only Android-managed onStartCommand may start recording, after startForeground succeeds.
     }
 
     private void startSessionInternal(String incomingSessionId) {
@@ -231,8 +239,8 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         if (pcm == null || pcm.length < 1600) {
             return false;
         }
-        double peak = Math.max(-18.0, latestMeasuredDb);
-        double avg = peak - 8.0;
+        double peak = latestMeasuredDb;
+        double avg = latestMeasuredDb;
         onSpeechCompleted(pcm, now - 1200, now, peak, avg);
         return true;
     }
@@ -415,6 +423,15 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     @Override
     public void onSpeechCompleted(byte[] pcmData, long startTimeMs, long endTimeMs, double peakDb, double avgDb) {
         int seq = sequenceIndex.getAndIncrement();
+        double sumSquares = 0; int peakAmplitude = 0;
+        for (int i = 0; i + 1 < pcmData.length; i += 2) {
+            short value = (short) ((pcmData[i] & 255) | (pcmData[i + 1] << 8));
+            peakAmplitude = Math.max(peakAmplitude, Math.abs((int) value));
+            sumSquares += (double) value * value;
+        }
+        peakDb = peakAmplitude == 0 ? -96 : 20 * Math.log10(peakAmplitude / 32768.0);
+        double rms = Math.sqrt(sumSquares / Math.max(1, pcmData.length / 2));
+        avgDb = rms == 0 ? -96 : Math.max(-96, 20 * Math.log10(rms / 32768.0));
         try {
             String activeSess = (sessionId != null) ? sessionId : "sess_android_default";
             File storageDir = new File(getSecureStorageRoot(), activeSess);
@@ -425,8 +442,8 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
             String baseName = "seg_" + seq + "_" + System.currentTimeMillis();
             AudioEncoder.EncodedAudio encoded = AudioEncoder.encodeToM4aOrWav(pcmData, storageDir, baseName, 16000);
 
-            if (syncUploadEnabled && appContext != null) {
-                AudioUploadWorker.enqueueUpload(
+            if (appContext != null) {
+                AudioUploadWorker.saveLocalRecording(
                         appContext,
                         activeSess,
                         seq,
