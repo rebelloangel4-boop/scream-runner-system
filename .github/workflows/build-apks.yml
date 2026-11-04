@@ -12,40 +12,42 @@ permissions:
 
 jobs:
   build-apks:
-    name: Build Scream Runner & Sam's Dashboard Release APKs
+    name: Build Scream Runner and Sam's Dashboard test APKs
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
-
-      - name: Install Android SDK Platform 34 & Build-Tools 34.0.0
+      - name: Install Android command line tools
         run: |
-          echo "y" | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Build Both Standalone Release APKs with Gradle
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl --fail --location --retry 3 --output /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+      - name: Build both debug APKs
         run: |
           chmod +x android/gradlew scripts/build_apks.sh
           bash scripts/build_apks.sh
-
-      - name: Upload Scream Runner APK Artifact
+      - name: Upload Scream Runner test APK
         uses: actions/upload-artifact@v4
         with:
-          name: scream-runner-apk
+          name: scream-runner-test-apk
           path: public/downloads/scream-runner.apk
           if-no-files-found: error
-
-      - name: Upload Sam's Dashboard APK Artifact
+      - name: Upload Sam's Dashboard test APK
         uses: actions/upload-artifact@v4
         with:
-          name: sams-dashboard-apk
+          name: sams-dashboard-test-apk
           path: public/downloads/sams-dashboard.apk
           if-no-files-found: error
-
