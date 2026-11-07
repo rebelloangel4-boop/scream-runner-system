@@ -1,0 +1,20 @@
+// Supply these through private CI/environment settings. No keys belong in Git.
+def releaseStore = System.getenv('SCREAM_RELEASE_KEYSTORE')
+def releaseStorePassword = System.getenv('SCREAM_RELEASE_STORE_PASSWORD')
+def releaseAlias = System.getenv('SCREAM_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('SCREAM_RELEASE_KEY_PASSWORD')
+def signingReady = releaseStore && releaseStorePassword && releaseAlias && releaseKeyPassword
+if (signingReady) {
+    android.signingConfigs.create('privateRelease') {
+        storeFile file(releaseStore)
+        storePassword releaseStorePassword
+        keyAlias releaseAlias
+        keyPassword releaseKeyPassword
+    }
+    android.buildTypes.release.signingConfig = android.signingConfigs.privateRelease
+}
+gradle.taskGraph.whenReady { graph ->
+    if (graph.allTasks.any { it.project == project && (it.name == 'packageRelease' || it.name == 'bundleRelease') } && !signingReady) {
+        throw new GradleException('Release signing is not configured. Provide the four private SCREAM_RELEASE_* settings; never use a debug key for production.')
+    }
+}

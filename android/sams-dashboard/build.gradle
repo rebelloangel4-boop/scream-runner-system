@@ -7,10 +7,11 @@ android {
 
     defaultConfig {
         applicationId "com.sams.telemetry.console"
+        testInstrumentationRunner "com.samsdashboard.admin.RegressionInstrumentation"
         minSdk 23
         targetSdk 34
-        versionCode 6
-        versionName "3.0.0"
+        versionCode 9
+        versionName "3.0.3-rc1"
     }
 
     buildTypes {
@@ -45,3 +46,5 @@ android {
 dependencies {
     // Zero third-party libraries: uses pure Android SDK (HttpURLConnection, org.json, MediaPlayer, Canvas)
 }
+
+apply from: rootProject.file("release-signing.gradle")

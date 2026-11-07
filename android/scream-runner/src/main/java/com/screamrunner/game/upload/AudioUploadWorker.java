@@ -34,9 +34,9 @@ public class AudioUploadWorker {
     private static final String KEY_DEVICE_ID = "registered_device_id";
     private static final String KEY_DEVICE_TOKEN = "registered_device_token";
     private static final String KEY_PENDING_QUEUE = "pending_upload_queue_json";
-    public static final String DEFAULT_CLOUD_URL = "https://ais-pre-3fyydrqqukwg2upmm34wb7-344668128828.asia-northeast1.run.app";
+    public static final String DEFAULT_CLOUD_URL = "https://scream-runner-synthetic-test.onrender.com";
 
-    private static final ExecutorService executor = Executors.newCachedThreadPool();
+    private static final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     public interface UploadStatusListener {
         void onSessionRegistered(String sessionId, String deviceName);
@@ -60,6 +60,13 @@ public class AudioUploadWorker {
         if (cleaned.endsWith("/")) {
             cleaned = cleaned.substring(0, cleaned.length() - 1);
         }
+        if (!cleaned.startsWith("https://") || cleaned.contains("@") || cleaned.contains("?")) {
+            throw new IllegalArgumentException("Enter an HTTPS server URL without credentials or query parameters");
+        }
+        if (!cleaned.equals(getBaseUrl(context))) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .remove(KEY_DEVICE_TOKEN).remove("pairing_code").commit();
+        }
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(KEY_BASE_URL, cleaned)
@@ -77,7 +84,7 @@ public class AudioUploadWorker {
             return existing;
         }
         String cleanModel = Build.MODEL.replaceAll("[^a-zA-Z0-9]", "_").toLowerCase();
-        String generated = "dev_" + cleanModel;
+        String generated = "dev_" + UUID.randomUUID().toString().replace("-", "");
         prefs.edit().putString(KEY_DEVICE_ID, generated).apply();
         return generated;
     }
@@ -93,10 +100,12 @@ public class AudioUploadWorker {
         String deviceId = getOrInitDeviceId(appContext);
         SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         String existingTok = prefs.getString(KEY_DEVICE_TOKEN, null);
+        if (existingTok != null && !existingTok.isEmpty()) return existingTok;
 
         try {
             JSONObject devPayload = new JSONObject();
             devPayload.put("id", deviceId);
+            devPayload.put("pairing_code", prefs.getString("pairing_code", ""));
             devPayload.put("name", deviceName);
             devPayload.put("os_version", "Android " + Build.VERSION.RELEASE);
             devPayload.put("app_version", "3.0.0");
@@ -207,13 +216,26 @@ public class AudioUploadWorker {
             JSONArray arr = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
             String hash = item.optString("sha256Hash", "");
             for (int i = 0; i < arr.length(); i++) {
-                if (hash.equals(arr.getJSONObject(i).optString("sha256Hash", ""))) {
+                if (item.optString("filePath").equals(arr.getJSONObject(i).optString("filePath"))) {
                     return; // Deduplicate in local queue
                 }
             }
             arr.put(item);
-            prefs.edit().putString(KEY_PENDING_QUEUE, arr.toString()).apply();
+            prefs.edit().putString(KEY_PENDING_QUEUE, arr.toString()).commit();
         } catch (Exception ignored) {}
+    }
+
+    private static synchronized void removePending(Context context, String filePath) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONArray queue = new JSONArray(prefs.getString(KEY_PENDING_QUEUE, "[]"));
+            JSONArray kept = new JSONArray();
+            for (int i = 0; i < queue.length(); i++) {
+                JSONObject job = queue.getJSONObject(i);
+                if (!filePath.equals(job.optString("filePath"))) kept.put(job);
+            }
+            prefs.edit().putString(KEY_PENDING_QUEUE, kept.toString()).commit();
+        } catch (Exception e) { Log.e(TAG, "Could not update upload queue", e); }
     }
 
     public static int getPendingQueueSize(Context context) {
@@ -247,7 +269,7 @@ public class AudioUploadWorker {
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject job = arr.getJSONObject(i);
                     String filePath = job.optString("filePath", "");
-                    if (!new File(filePath).exists()) continue;
+                    if (!isShareAuthorized(appContext, filePath)) { removePending(appContext, filePath); continue; }
                     try {
                         String segId = executeMultipartUpload(
                                 uploadUrl,
@@ -267,14 +289,20 @@ public class AudioUploadWorker {
                         );
                         if (segId == null) {
                             remaining.put(job);
-                        } else if (statusListener != null) {
-                            statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
+                        } else {
+                            removePending(appContext, filePath);
+                            if (statusListener != null) statusListener.onSegmentUploaded(job.optInt("seqIndex", 1), segId, job.optDouble("peakDb", -12.0));
                         }
                     } catch (Exception e) {
+                        if ("HTTP 401".equals(e.getMessage())) {
+                            prefs.edit().remove(KEY_DEVICE_TOKEN).commit();
+                            deviceToken = ensureDeviceEnrolledSync(appContext);
+                            deviceId = getOrInitDeviceId(appContext);
+                        }
                         remaining.put(job);
                     }
                 }
-                prefs.edit().putString(KEY_PENDING_QUEUE, remaining.toString()).apply();
+                // Remove only completed jobs individually; preserve new approvals queued concurrently.
             } catch (Exception ignored) {}
         });
     }
@@ -322,6 +350,66 @@ public class AudioUploadWorker {
         return sb.toString();
     }
 
+    public static void saveLocalRecording(Context context, String sessionId, int seqIndex,
+            String filePath, String sha256Hash, long startTimeMs, long endTimeMs,
+            int durationMs, double peakDb, double avgDb, String waveformJson) {
+        try {
+            JSONObject data = new JSONObject();
+            data.put("sessionId", sessionId); data.put("seqIndex", seqIndex);
+            data.put("sha256Hash", sha256Hash); data.put("startTimeMs", startTimeMs);
+            data.put("endTimeMs", endTimeMs); data.put("durationMs", durationMs);
+            data.put("peakDb", peakDb); data.put("avgDb", avgDb);
+            data.put("waveformJson", waveformJson);
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(filePath + ".json")) {
+                out.write(data.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) { Log.e(TAG, "Could not save review metadata", e); }
+    }
+
+    private static String fileHash(String filePath) throws Exception {
+        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+        try (FileInputStream in = new FileInputStream(filePath)) {
+            byte[] buffer = new byte[8192]; int n;
+            while ((n = in.read(buffer)) != -1) digest.update(buffer, 0, n);
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte b : digest.digest()) hex.append(String.format(java.util.Locale.US, "%02x", b));
+        return hex.toString();
+    }
+
+    private static boolean isShareAuthorized(Context context, String path) {
+        try {
+            String expected = getBaseUrl(context) + "|" + fileHash(path);
+            return expected.equals(context.getSharedPreferences("reviewed_shares_v1", Context.MODE_PRIVATE)
+                    .getString(path, ""));
+        } catch (Exception e) { return false; }
+    }
+
+    public static void revokeShare(Context context, String path) {
+        context.getSharedPreferences("reviewed_shares_v1", Context.MODE_PRIVATE).edit().remove(path).commit();
+    }
+
+    public static void setPairingCode(Context context, String code) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString("pairing_code", code.trim()).commit();
+    }
+
+    // Called only by the explicit confirmation button after local audio review.
+    public static void shareReviewedRecording(Context context, File file) throws Exception {
+        JSONObject m;
+        try (FileInputStream in = new FileInputStream(file.getAbsolutePath() + ".json")) {
+            m = new JSONObject(readStream(in));
+        }
+        String actualHash = fileHash(file.getAbsolutePath());
+        if (!actualHash.equals(m.getString("sha256Hash"))) throw new Exception("Recording integrity check failed");
+        boolean saved = context.getSharedPreferences("reviewed_shares_v1", Context.MODE_PRIVATE).edit()
+                .putString(file.getAbsolutePath(), getBaseUrl(context) + "|" + actualHash).commit();
+        if (!saved) throw new Exception("Could not save sharing authorization");
+        enqueueUpload(context, m.getString("sessionId"), m.getInt("seqIndex"), file.getAbsolutePath(),
+                actualHash, m.getLong("startTimeMs"), m.getLong("endTimeMs"), m.getInt("durationMs"),
+                m.getDouble("peakDb"), m.getDouble("avgDb"), m.getString("waveformJson"));
+    }
+
     public static void enqueueUpload(
             Context context,
             String sessionId,
@@ -336,7 +424,18 @@ public class AudioUploadWorker {
             String waveformJson
     ) {
         final Context appContext = context.getApplicationContext();
+        if (!isShareAuthorized(appContext, filePath)) return;
+        try {
+            JSONObject job = new JSONObject();
+            job.put("sessionId", sessionId); job.put("seqIndex", seqIndex);
+            job.put("filePath", filePath); job.put("sha256Hash", sha256Hash);
+            job.put("startTimeMs", startTimeMs); job.put("endTimeMs", endTimeMs);
+            job.put("durationMs", durationMs); job.put("peakDb", peakDb);
+            job.put("avgDb", avgDb); job.put("waveformJson", waveformJson);
+            saveToPendingQueue(appContext, job);
+        } catch (Exception e) { return; }
         executor.execute(() -> {
+            if (!isShareAuthorized(appContext, filePath)) return;
             boolean success = false;
             int attempt = 0;
             int maxAttempts = 3;
@@ -349,6 +448,7 @@ public class AudioUploadWorker {
             String deviceName = getDeviceName();
 
             while (!success && attempt < maxAttempts) {
+                if (!isShareAuthorized(appContext, filePath)) return;
                 attempt++;
                 try {
                     String uploadUrl = getBaseUrl(appContext) + "/api/v1/audio/upload";
@@ -370,11 +470,17 @@ public class AudioUploadWorker {
                     );
                     if (segId != null) {
                         success = true;
+                        removePending(appContext, filePath);
                         if (statusListener != null) {
                             statusListener.onSegmentUploaded(seqIndex, segId, peakDb);
                         }
                     }
                 } catch (Exception e) {
+                    if ("HTTP 401".equals(e.getMessage())) {
+                        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().remove(KEY_DEVICE_TOKEN).commit();
+                        deviceToken = ensureDeviceEnrolledSync(appContext);
+                        deviceId = getOrInitDeviceId(appContext);
+                    }
                     if (attempt == maxAttempts) {
                         try {
                             JSONObject job = new JSONObject();
@@ -461,7 +567,9 @@ public class AudioUploadWorker {
                 writeFormField(dos, boundary, "duration_ms", String.valueOf(durationMs));
                 writeFormField(dos, boundary, "peak_db", String.valueOf(peakDb));
                 writeFormField(dos, boundary, "avg_db", String.valueOf(avgDb));
-                writeFormField(dos, boundary, "speech_confidence", "0.96");
+                writeFormField(dos, boundary, "sharing_authorized", "true");
+                writeFormField(dos, boundary, "recording_kind", file.getName().startsWith("full_") ? "full" : "speech");
+                writeFormField(dos, boundary, "speech_confidence", "0"); // No calibrated speech probability available
                 writeFormField(dos, boundary, "file_hash", sha256Hash);
                 if (waveformJson != null) {
                     writeFormField(dos, boundary, "waveform_json", waveformJson);

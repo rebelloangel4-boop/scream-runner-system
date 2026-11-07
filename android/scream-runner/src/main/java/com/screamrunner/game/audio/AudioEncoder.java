@@ -77,7 +77,9 @@ public class AudioEncoder {
             boolean outputDone = false;
             int trackIndex = -1;
 
+            long deadline = android.os.SystemClock.elapsedRealtime() + 15000;
             while (!outputDone) {
+                if (android.os.SystemClock.elapsedRealtime() > deadline) throw new IOException("AAC encoder timed out");
                 if (!inputDone) {
                     int inIndex = codec.dequeueInputBuffer(10000);
                     if (inIndex >= 0) {
@@ -121,6 +123,9 @@ public class AudioEncoder {
                     }
                 }
             }
+            if (!muxerStarted) throw new IOException("AAC encoder produced no track");
+            muxer.stop();
+            muxerStarted = false;
             return outputFile.exists() && outputFile.length() > 128;
         } finally {
             if (codec != null) {
@@ -210,12 +215,12 @@ public class AudioEncoder {
         int totalSamples = pcmData.length / 2;
         if (totalSamples == 0) return "[]";
 
-        int samplesPerBar = Math.max(1, totalSamples / numBars);
+        numBars = Math.max(1, Math.min(numBars, totalSamples));
         StringBuilder sb = new StringBuilder("[");
 
         for (int bar = 0; bar < numBars; bar++) {
-            int start = bar * samplesPerBar;
-            int end = Math.min(start + samplesPerBar, totalSamples);
+            int start = bar * totalSamples / numBars;
+            int end = (bar + 1) * totalSamples / numBars;
             double sumSq = 0;
             int count = 0;
 
@@ -228,7 +233,7 @@ public class AudioEncoder {
             }
 
             double rms = (count > 0) ? Math.sqrt(sumSq / count) : 0;
-            double norm = Math.min(1.0, Math.max(0.04, rms / 32768.0));
+            double norm = Math.min(1.0, Math.max(0.0, rms / 32768.0));
             sb.append(String.format(Locale.US, "%.3f", norm));
             if (bar < numBars - 1) {
                 sb.append(",");

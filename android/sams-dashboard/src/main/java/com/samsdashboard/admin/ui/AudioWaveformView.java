@@ -99,9 +99,9 @@ public class AudioWaveformView extends View {
 
             // Highlight bar color if peak loudness > -10 dB
             if (isHighlight && amp > 0.65f) {
-                canvas.drawRoundRect(new RectF(left, top, right, bottom), 4, 4, highlightPaint);
+                canvas.drawRoundRect(left, top, right, bottom, 4, 4, highlightPaint);
             } else {
-                canvas.drawRoundRect(new RectF(left, top, right, bottom), 4, 4, barPaint);
+                canvas.drawRoundRect(left, top, right, bottom, 4, 4, barPaint);
             }
         }
 
@@ -110,7 +110,7 @@ public class AudioWaveformView extends View {
         canvas.drawLine(playheadX, 0, playheadX, height, playheadPaint);
 
         // Draw Peak dB badge
-        String dbText = String.format(java.util.Locale.US, "Peak: %.1f dB", peakDb);
+        String dbText = String.format(java.util.Locale.US, "Peak: %.1f dBFS", peakDb);
         canvas.drawText(dbText, width - 180, 36, textPaint);
     }
 

@@ -35,6 +35,10 @@ public class AudioPlayerController {
     private PlayerCallback callback;
     private boolean isUpdatingProgress = false;
     private float currentSpeed = 1.0f;
+    private volatile long playbackGeneration = 0;
+    private boolean prepared = false;
+    private boolean released = false;
+    private File cachedFile;
 
     public AudioPlayerController(Context context) {
         this.context = context.getApplicationContext();
@@ -47,11 +51,13 @@ public class AudioPlayerController {
     public void playLocalDemoTone(float speed) {
         stop();
         this.currentSpeed = speed;
+        final long request = playbackGeneration;
+        if (released) return;
         downloadExecutor.execute(() -> {
             try {
                 File demoWav = new File(context.getCacheDir(), "local_demo_sample.wav");
                 writeSynthesizedDemoWav(demoWav);
-                progressHandler.post(() -> playCachedFile(demoWav));
+                progressHandler.post(() -> { if (request == playbackGeneration && !released) playCachedFile(demoWav); });
             } catch (Exception e) {
                 postError("Demo audio error: " + e.getMessage());
             }
@@ -106,11 +112,14 @@ public class AudioPlayerController {
     public void playUrl(String streamUrl, float speed, String authToken) {
         stop();
         this.currentSpeed = speed;
+        final long request = playbackGeneration;
+        if (released) return;
 
         downloadExecutor.execute(() -> {
-            File tempWav = new File(context.getCacheDir(), "playback_stream.wav");
+            File tempWav = null;
             HttpURLConnection conn = null;
             try {
+                tempWav = File.createTempFile("playback_", ".audio", context.getCacheDir());
                 URL url = new URL(streamUrl);
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("GET");
@@ -130,16 +139,25 @@ public class AudioPlayerController {
                      FileOutputStream out = new FileOutputStream(tempWav)) {
                     byte[] buf = new byte[8192];
                     int read;
+                    long total = 0;
                     while ((read = in.read(buf)) != -1) {
+                        if (request != playbackGeneration || released) { tempWav.delete(); return; }
+                        total += read;
+                        if (total > 25L * 1024 * 1024) throw new java.io.IOException("Audio exceeds playback size limit");
                         out.write(buf, 0, read);
                     }
                     out.flush();
                 }
 
-                progressHandler.post(() -> playCachedFile(tempWav));
+                final File completed = tempWav;
+                progressHandler.post(() -> {
+                    if (request == playbackGeneration && !released) playCachedFile(completed);
+                    else completed.delete();
+                });
             } catch (Exception e) {
                 Log.e(TAG, "Error downloading audio stream", e);
-                postError("Audio fetch failed: " + e.getMessage());
+                if (tempWav != null) tempWav.delete();
+                if (request == playbackGeneration && !released) postError("Audio fetch failed: " + e.getMessage());
             } finally {
                 if (conn != null) {
                     conn.disconnect();
@@ -149,7 +167,8 @@ public class AudioPlayerController {
     }
 
     private void playCachedFile(File wavFile) {
-        stop();
+        releasePlayer();
+        cachedFile = wavFile;
         try {
             mediaPlayer = new MediaPlayer();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -162,8 +181,9 @@ public class AudioPlayerController {
                 mediaPlayer.setDataSource(fis.getFD());
             }
             mediaPlayer.setOnPreparedListener(mp -> {
-                setSpeed(currentSpeed);
+                prepared = true;
                 mp.start();
+                setSpeed(currentSpeed);
                 startProgressTracker();
             });
             mediaPlayer.setOnCompletionListener(mp -> {
@@ -193,13 +213,13 @@ public class AudioPlayerController {
     }
 
     public void pause() {
-        if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+        if (prepared && mediaPlayer != null && mediaPlayer.isPlaying()) {
             mediaPlayer.pause();
         }
     }
 
     public void resume() {
-        if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
+        if (prepared && mediaPlayer != null && !mediaPlayer.isPlaying()) {
             mediaPlayer.start();
             startProgressTracker();
         }
@@ -233,6 +253,19 @@ public class AudioPlayerController {
     }
 
     public void stop() {
+        playbackGeneration++;
+        releasePlayer();
+    }
+
+    public void release() {
+        released = true;
+        stop();
+        callback = null;
+        downloadExecutor.shutdownNow();
+    }
+
+    private void releasePlayer() {
+        prepared = false;
         stopProgressTracker();
         if (mediaPlayer != null) {
             try {
@@ -243,9 +276,11 @@ public class AudioPlayerController {
             } catch (Exception ignored) {}
             mediaPlayer = null;
         }
+        if (cachedFile != null) { cachedFile.delete(); cachedFile = null; }
     }
 
     private void startProgressTracker() {
+        stopProgressTracker();
         isUpdatingProgress = true;
         progressHandler.post(new Runnable() {
             @Override

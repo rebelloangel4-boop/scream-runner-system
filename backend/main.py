@@ -1,4 +1,6 @@
 import os
+import io
+import wave
 import sys
 import time
 import uuid
@@ -38,6 +40,7 @@ DB_PATH = STORAGE_DIR / "scream_runner.db"
 JWT_SECRET_FILE = STORAGE_DIR / ".jwt_secret"
 LEGACY_SECRET_FILE = STORAGE_DIR / ".admin_secret"
 
+os.umask(0o077)
 AUDIO_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -70,6 +73,13 @@ def load_or_create_jwt_secret() -> str:
 
 
 JWT_SECRET = load_or_create_jwt_secret()
+# Scope JWTs to this database generation. Ephemeral restarts must not resurrect revoked tokens.
+AUTH_EPOCH_FILE = STORAGE_DIR / ".auth_epoch"
+if not AUTH_EPOCH_FILE.exists():
+    AUTH_EPOCH_FILE.write_text(secrets.token_hex(32))
+    os.chmod(AUTH_EPOCH_FILE, 0o600)
+AUTH_EPOCH = AUTH_EPOCH_FILE.read_text().strip()
+INSTANCE_ID = uuid.uuid4().hex
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL_SEC = 3600       # 1 hour short-lived access token
 REFRESH_TOKEN_TTL_SEC = 604800    # 7 days refresh token
@@ -209,6 +219,22 @@ def init_db():
         );
         """)
 
+        segment_cols = [r["name"] for r in conn.execute("PRAGMA table_info(audio_segments)").fetchall()]
+        if "recording_kind" not in segment_cols:
+            conn.execute("ALTER TABLE audio_segments ADD COLUMN recording_kind TEXT NOT NULL DEFAULT 'speech'")
+
+        # Identical silence/tone bytes at different times are distinct recordings.
+        # Migrate the old content-only UNIQUE key transactionally, preserving every row.
+        schema = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'audio_segments'").fetchone()[0]
+        if "UNIQUE(session_id, file_hash)" in schema:
+            revised = schema.replace("audio_segments", "audio_segments_v4", 1).replace(
+                "UNIQUE(session_id, file_hash)",
+                "UNIQUE(session_id, seq_index, start_time, end_time, recording_kind, file_hash)")
+            conn.execute(revised)
+            conn.execute("INSERT INTO audio_segments_v4 SELECT * FROM audio_segments")
+            conn.execute("DROP TABLE audio_segments")
+            conn.execute("ALTER TABLE audio_segments_v4 RENAME TO audio_segments")
+
         # Apply v3 migration columns safely if upgrading from v2.x database
         existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()]
         if "os_version" not in existing_cols:
@@ -308,11 +334,15 @@ def record_event(conn: sqlite3.Connection, event_type: str, session_id: Optional
 def create_jwt_token(subject: str, role: str = "admin", token_type: str = "access", expires_in_seconds: int = ACCESS_TOKEN_TTL_SEC) -> str:
     jti = str(uuid.uuid4())
     now = int(time.time())
+    with get_db_conn() as conn:
+        user = conn.execute("SELECT updated_at FROM admin_users WHERE username = ?", (subject,)).fetchone()
     payload = {
         "sub": subject,
         "role": role,
         "type": token_type,
         "jti": jti,
+        "auth_epoch": AUTH_EPOCH,
+        "password_version": user["updated_at"] if user else None,
         "iat": now,
         "exp": now + expires_in_seconds
     }
@@ -321,12 +351,15 @@ def create_jwt_token(subject: str, role: str = "admin", token_type: str = "acces
 
 def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expected_role: str = "admin") -> dict:
     try:
-        payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                             options={"require": ["exp", "iat", "sub", "jti"]})
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
 
+    if payload.get("auth_epoch") != AUTH_EPOCH:
+        raise HTTPException(status_code=401, detail="Server storage reset; sign in again")
     if payload.get("type") != expected_type:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -341,7 +374,10 @@ def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expec
     jti = payload.get("jti")
     conn = get_db_conn()
     revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
+    user = conn.execute("SELECT updated_at FROM admin_users WHERE username = ?", (payload.get("sub"),)).fetchone()
     conn.close()
+    if not user or payload.get("password_version") != user["updated_at"]:
+        raise HTTPException(status_code=401, detail="Credentials changed; sign in again")
     if revoked:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
     return payload
@@ -429,6 +465,7 @@ class RefreshRequest(BaseModel):
 
 
 class DeviceRegisterRequest(BaseModel):
+    pairing_code: str = ""
     id: Optional[str] = None
     name: str
     os_version: Optional[str] = "Android 14"
@@ -439,7 +476,7 @@ class SessionCreateRequest(BaseModel):
     session_id: Optional[str] = None
     device_id: str
     device_name: Optional[str] = None
-    consent_confirmed: bool = True
+    consent_confirmed: bool = False
 
 
 class SessionStopRequest(BaseModel):
@@ -484,7 +521,10 @@ def auth_setup_status():
 
 
 @app.post("/api/v1/auth/setup")
-def setup_first_admin(req: AdminSetupRequest, request: Request):
+def setup_first_admin(req: AdminSetupRequest, request: Request, x_setup_token: Optional[str] = Header(None)):
+    expected = os.environ.get("ADMIN_SETUP_TOKEN", "")
+    if len(expected) < 32 or not x_setup_token or not hmac.compare_digest(expected, x_setup_token):
+        raise HTTPException(status_code=403, detail="Private deployment setup token required")
     username = req.username.strip()
     password = req.password
     if len(username) < 3:
@@ -493,6 +533,7 @@ def setup_first_admin(req: AdminSetupRequest, request: Request):
         raise HTTPException(status_code=400, detail="Administrator password must be at least 8 characters")
 
     conn = get_db_conn()
+    conn.execute("BEGIN IMMEDIATE")
     existing = conn.execute("SELECT username FROM admin_users LIMIT 1").fetchone()
     if existing:
         conn.close()
@@ -758,47 +799,52 @@ def download_apk(filename: str):
 
 
 # ----------------- Authenticated Device Enrollment & Management -----------------
+@app.get("/api/v1/devices/pairing-code")
+def get_pairing_code(auth: dict = Depends(verify_admin_token)):
+    # Generated by the deployment owner, never embedded in either APK.
+    code = os.environ.get("DEVICE_PAIRING_CODE", "")
+    if len(code) < 16:
+        raise HTTPException(status_code=503, detail="Configure DEVICE_PAIRING_CODE (at least 16 random characters) privately on the backend")
+    return {"pairing_code": code}
+
+
 @app.post("/api/v1/devices/register")
-async def register_device(req: DeviceRegisterRequest):
+async def register_device(req: DeviceRegisterRequest, request: Request):
+    check_rate_limit(request.client.host if request.client else "unknown")
+    code = os.environ.get("DEVICE_PAIRING_CODE", "")
+    if len(code) < 16 or not hmac.compare_digest(req.pairing_code, code):
+        record_failed_attempt(request.client.host if request.client else "unknown")
+        raise HTTPException(status_code=403, detail="Valid private pairing code required")
     name = req.name.strip()
     if not name or len(name) > 120:
         raise HTTPException(status_code=400, detail="Valid device name is required")
-
-    conn = get_db_conn()
+    # Never disclose another device's token based on a public name or identifier.
+    device_id = "dev_" + uuid.uuid4().hex
+    token = "dev_tok_" + secrets.token_hex(32)
     now = time.time()
-    existing = None
-    if req.id:
-        existing = conn.execute("SELECT id, device_token FROM devices WHERE id = ?", (req.id.strip(),)).fetchone()
-    if not existing:
-        existing = conn.execute("SELECT id, device_token FROM devices WHERE name = ?", (name,)).fetchone()
-
-    if existing:
-        device_id = existing["id"]
-        token = existing["device_token"]
-        conn.execute(
-            "UPDATE devices SET last_ping = ?, status = 'online', name = ?, os_version = ?, app_version = ? WHERE id = ?",
-            (now, name, req.os_version or "Android", req.app_version or "3.0.0", device_id)
-        )
-    else:
-        device_id = (req.id.strip() if req.id else None) or f"dev_{uuid.uuid4().hex[:10]}"
-        token = f"dev_tok_{secrets.token_hex(24)}"
+    with get_db_conn() as conn:
         conn.execute(
             "INSERT INTO devices (id, name, device_token, os_version, app_version, registered_at, last_ping, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (device_id, name, token, req.os_version or "Android", req.app_version or "3.0.0", now, now, "online")
-        )
-    seq = record_event(conn, "DEVICE_REGISTERED", None, {"device_id": device_id, "name": name})
-    conn.commit()
+            (device_id, name, token, req.os_version, req.app_version, now, now, "online"))
+        record_event(conn, "DEVICE_REGISTERED", None, {"device_id": device_id, "name": name})
     conn.close()
-
-    await manager.broadcast({
-        "type": "DEVICE_REGISTERED",
-        "seq": seq,
-        "device_id": device_id,
-        "name": name,
-        "status": "online",
-        "last_ping": now
-    })
     return {"device_id": device_id, "device_token": token, "status": "registered"}
+
+
+def require_device_owner(actor: dict, device_id: str):
+    if actor.get("actor") == "device" and actor.get("device_id") != device_id:
+        raise HTTPException(status_code=403, detail="Device does not own this resource")
+
+
+def require_session_owner(conn, actor, session_id):
+    row = conn.execute("SELECT device_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if row:
+        try:
+            require_device_owner(actor, row["device_id"])
+        except HTTPException:
+            conn.close()
+            raise
+    return row
 
 
 @app.post("/api/v1/devices/{device_id}/ping")
@@ -808,6 +854,7 @@ async def ping_device(
     name: Optional[str] = None,
     actor: dict = Depends(verify_device_or_admin)
 ):
+    require_device_owner(actor, device_id)
     conn = get_db_conn()
     now = time.time()
     existing = conn.execute("SELECT id FROM devices WHERE id = ?", (device_id,)).fetchone()
@@ -846,6 +893,7 @@ def list_devices(auth: dict = Depends(verify_admin_token)):
 # ----------------- Sessions -----------------
 @app.post("/api/v1/sessions/start")
 async def start_session(req: SessionCreateRequest, actor: dict = Depends(verify_device_or_admin)):
+    require_device_owner(actor, req.device_id)
     if not req.consent_confirmed:
         raise HTTPException(status_code=400, detail="Explicit user microphone consent is required to start a session")
 
@@ -864,8 +912,9 @@ async def start_session(req: SessionCreateRequest, actor: dict = Depends(verify_
         conn.execute("UPDATE devices SET last_ping = ?, status = 'recording' WHERE id = ?", (now, req.device_id))
 
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:10]}"
+    require_session_owner(conn, actor, session_id)
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (id, device_id, started_at, consent_confirmed, status, total_speech_segments)
+        """INSERT OR IGNORE INTO sessions (id, device_id, started_at, consent_confirmed, status, total_speech_segments)
            VALUES (?, ?, ?, 1, 'active', COALESCE((SELECT total_speech_segments FROM sessions WHERE id = ?), 0))""",
         (session_id, req.device_id, now, session_id)
     )
@@ -887,6 +936,7 @@ async def start_session(req: SessionCreateRequest, actor: dict = Depends(verify_
 @app.post("/api/v1/sessions/stop")
 async def stop_session(req: SessionStopRequest, actor: dict = Depends(verify_device_or_admin)):
     conn = get_db_conn()
+    require_session_owner(conn, actor, req.session_id)
     now = time.time()
     row = conn.execute("SELECT started_at, device_id FROM sessions WHERE id = ?", (req.session_id,)).fetchone()
     if not row:
@@ -916,12 +966,16 @@ async def stop_session(req: SessionStopRequest, actor: dict = Depends(verify_dev
 @app.post("/api/v1/sessions/interruption")
 async def log_session_interruption(req: SessionInterruptionRequest, actor: dict = Depends(verify_device_or_admin)):
     conn = get_db_conn()
+    if not require_session_owner(conn, actor, req.session_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail="Session not found")
     ev_type = req.event_type if req.event_type in ("INTERRUPTION", "NETWORK_LOSS") else "INTERRUPTION"
     seq = record_event(conn, ev_type, req.session_id, {
         "reason": req.reason,
         "duration_ms": req.duration_ms,
         "timestamp": time.time()
     })
+    conn.commit()
     conn.close()
     await manager.broadcast({
         "type": ev_type,
@@ -957,26 +1011,78 @@ def list_sessions(auth: dict = Depends(verify_admin_token)):
 
 
 def compute_waveform_from_wav_bytes(contents: bytes, num_bars: int = 50) -> str:
-    pcm = contents[44:] if len(contents) > 44 and contents[:4] == b'RIFF' else contents
+    try:
+        with wave.open(io.BytesIO(contents), "rb") as audio:
+            if audio.getsampwidth() != 2 or audio.getnchannels() != 1:
+                return "[]"
+            pcm = audio.readframes(audio.getnframes())
+    except (wave.Error, EOFError):
+        return "[]"
     total_samples = len(pcm) // 2
     if total_samples <= 0:
-        return "[0.2,0.4,0.7,0.5,0.3]"
-    samples_per_bar = max(1, total_samples // num_bars)
+        return "[]"
+    num_bars = max(1, min(num_bars, total_samples))
     bars = []
     for b in range(num_bars):
-        start = b * samples_per_bar
-        end = min(start + samples_per_bar, total_samples)
+        start = b * total_samples // num_bars
+        end = (b + 1) * total_samples // num_bars
         sum_sq = 0.0
         count = end - start
         for i in range(start, end):
             sample = int.from_bytes(pcm[i * 2: i * 2 + 2], byteorder='little', signed=True)
             sum_sq += sample * sample
         rms = math.sqrt(sum_sq / count) if count > 0 else 0.0
-        bars.append(round(min(1.0, max(0.05, (rms / 32768.0) * 3.0)), 3))
+        bars.append(round(min(1.0, max(0.0, rms / 32768.0)), 3))
     return json.dumps(bars)
 
 
 # ----------------- Audio Upload & Ingestion -----------------
+def validate_audio_container(contents: bytes, extension: str):
+    """Reject renamed arbitrary bytes and truncated containers before persistence."""
+    try:
+        if extension == ".wav":
+            with wave.open(io.BytesIO(contents), "rb") as audio:
+                if audio.getnchannels() != 1 or audio.getsampwidth() != 2 or audio.getframerate() not in (16000, 44100, 48000):
+                    raise ValueError("Expected mono PCM16 audio")
+                frames = audio.getnframes()
+                if frames < 1 or len(audio.readframes(frames)) != frames * 2:
+                    raise ValueError("Truncated WAV")
+        elif extension == ".m4a":
+            boxes = set()
+            offset = 0
+            while offset < len(contents):
+                if offset + 8 > len(contents):
+                    raise ValueError("Truncated M4A box")
+                size, kind = struct.unpack_from(">I4s", contents, offset)
+                header = 8
+                if size == 1:
+                    if offset + 16 > len(contents):
+                        raise ValueError("Truncated M4A header")
+                    size = struct.unpack_from(">Q", contents, offset + 8)[0]
+                    header = 16
+                if size == 0:
+                    size = len(contents) - offset
+                if size < header or offset + size > len(contents):
+                    raise ValueError("Invalid M4A box size")
+                boxes.add(kind)
+                offset += size
+            if not {b"ftyp", b"moov", b"mdat"}.issubset(boxes):
+                raise ValueError("Incomplete M4A container")
+        elif extension == ".aac":
+            offset = 0
+            while offset < len(contents):
+                if offset + 7 > len(contents) or contents[offset] != 255 or contents[offset + 1] & 246 != 240:
+                    raise ValueError("Invalid ADTS frame")
+                size = ((contents[offset + 3] & 3) << 11) | (contents[offset + 4] << 3) | (contents[offset + 5] >> 5)
+                if size < 7 or offset + size > len(contents):
+                    raise ValueError("Truncated ADTS frame")
+                offset += size
+        else:
+            raise ValueError("Unsupported audio extension")
+    except (ValueError, wave.Error, EOFError, struct.error) as exc:
+        raise HTTPException(status_code=400, detail="Invalid audio file: " + str(exc))
+
+
 @app.post("/api/v1/audio/upload")
 async def upload_audio_segment(
     audio_file: UploadFile = File(...),
@@ -987,22 +1093,43 @@ async def upload_audio_segment(
     duration_ms: int = Form(...),
     peak_db: float = Form(...),
     avg_db: float = Form(...),
-    speech_confidence: float = Form(0.95),
+    speech_confidence: float = Form(0.0),
+    sharing_authorized: bool = Form(False),
+    recording_kind: str = Form("speech"),
     file_hash: Optional[str] = Form(None),
     waveform_json: Optional[str] = Form(None),
     device_id: Optional[str] = Form(None),
     device_name: Optional[str] = Form(None),
     actor: dict = Depends(verify_device_or_admin)
 ):
-    contents = await audio_file.read()
+    if recording_kind not in ("full", "speech"):
+        raise HTTPException(status_code=400, detail="Invalid recording kind")
+    if not sharing_authorized:
+        raise HTTPException(status_code=403, detail="Review and explicit sharing authorization are required")
+    resolved_device_id = device_id or actor.get("device_id")
+    if not resolved_device_id:
+        raise HTTPException(status_code=400, detail="A paired device is required")
+    require_device_owner(actor, resolved_device_id)
+    if (not all(math.isfinite(v) for v in (start_time, end_time, peak_db, avg_db, speech_confidence))
+            or duration_ms <= 0 or end_time < start_time or seq_index < 1
+            or not -120 <= peak_db <= 0 or not -120 <= avg_db <= 0
+            or not 0 <= speech_confidence <= 1):
+        raise HTTPException(status_code=400, detail="Invalid measured audio metadata")
+    contents = await audio_file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Uploaded audio file exceeds 25 MB limit")
 
     computed_hash = hashlib.sha256(contents).hexdigest()
+    if os.environ.get("SYNTHETIC_TEST_ONLY") == "1":
+        from backend.synthetic_fixture import synthetic_wav
+        if not hmac.compare_digest(computed_hash, hashlib.sha256(synthetic_wav()).hexdigest()):
+            raise HTTPException(status_code=403, detail="Temporary test deployment accepts only its synthetic test clip; private recordings are blocked")
     if file_hash and file_hash.strip().lower() != computed_hash.lower():
         raise HTTPException(status_code=400, detail="SHA-256 integrity verification failed")
+    ext = Path(audio_file.filename or "").suffix.lower()
+    validate_audio_container(contents, ext)
 
     final_hash = computed_hash
     safe_session_id = "".join(c for c in session_id if c.isalnum() or c in ("_", "-"))[:64]
@@ -1010,9 +1137,11 @@ async def upload_audio_segment(
         raise HTTPException(status_code=400, detail="Invalid session_id")
 
     conn = get_db_conn()
+    require_session_owner(conn, actor, safe_session_id)
     existing = conn.execute(
-        "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ?",
-        (safe_session_id, final_hash)
+        "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ? "
+        "AND seq_index = ? AND start_time = ? AND end_time = ? AND recording_kind = ?",
+        (safe_session_id, final_hash, seq_index, start_time, end_time, recording_kind)
     ).fetchone()
 
     if existing:
@@ -1025,15 +1154,26 @@ async def upload_audio_segment(
             "message": "Segment already ingested with identical SHA-256 hash (idempotent)."
         }
 
+    try:
+        waveform = json.loads(waveform_json) if waveform_json else json.loads(compute_waveform_from_wav_bytes(contents))
+        if not isinstance(waveform, list) or len(waveform) > 10000 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in waveform):
+            raise ValueError()
+        final_waveform = json.dumps(waveform, allow_nan=False)
+    except (ValueError, TypeError):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid measured waveform")
     segment_id = str(uuid.uuid4())
     session_audio_dir = AUDIO_STORAGE_DIR / safe_session_id
     session_audio_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_ext = Path(audio_file.filename).suffix.lower() if audio_file.filename else ".wav"
-    ext = raw_ext if raw_ext in (".wav", ".m4a", ".aac") else ".wav"
     dest_path = session_audio_dir / f"{segment_id}{ext}"
-    with open(dest_path, "wb") as f:
+    temporary_path = dest_path.with_suffix(ext + ".partial")
+    with open(temporary_path, "wb") as f:
         f.write(contents)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_path, dest_path)
 
     now = time.time()
     resolved_device_id = device_id or actor.get("device_id") or "dev_enrolled"
@@ -1054,7 +1194,6 @@ async def upload_audio_segment(
         VALUES (?, ?, ?, 1, 'active')
     """, (safe_session_id, resolved_device_id, now))
 
-    final_waveform = waveform_json if waveform_json else compute_waveform_from_wav_bytes(contents)
 
     conn.execute("""
         INSERT INTO audio_segments (
@@ -1067,6 +1206,7 @@ async def upload_audio_segment(
         peak_db, avg_db, speech_confidence, str(dest_path), final_hash, len(contents),
         now, final_waveform
     ))
+    conn.execute("UPDATE audio_segments SET recording_kind = ? WHERE id = ?", (recording_kind, segment_id))
     conn.execute("UPDATE sessions SET total_speech_segments = total_speech_segments + 1 WHERE id = ?", (safe_session_id,))
 
     is_highlight = peak_db > -10.0
@@ -1108,7 +1248,7 @@ def get_session_segments(session_id: str, auth: dict = Depends(verify_admin_toke
     conn = get_db_conn()
     rows = conn.execute("""
         SELECT id, session_id, seq_index, start_time, end_time, duration_ms,
-               peak_db, avg_db, speech_confidence, file_hash, file_size_bytes, created_at, waveform_data
+               peak_db, avg_db, speech_confidence, file_hash, file_size_bytes, created_at, waveform_data, recording_kind
         FROM audio_segments
         WHERE session_id = ?
         ORDER BY seq_index ASC, created_at ASC
@@ -1314,7 +1454,42 @@ def export_portable_backup(include_audio_base64: bool = True, auth: dict = Depen
 
 @app.post("/api/v1/storage/restore")
 def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(verify_admin_token)):
+    if os.environ.get("SYNTHETIC_TEST_ONLY") == "1":
+        raise HTTPException(status_code=403, detail="Backup import disabled on synthetic-only test deployment")
     """Restores devices, sessions, and audio files from a portable backup snapshot."""
+    # Validate the complete archive before writing any file or database row.
+    # Backup paths are untrusted even when the caller is an administrator.
+    import re
+    prepared_audio = {}
+    try:
+        for row in (req.devices or []) + (req.sessions or []) + (req.audio_segments or []):
+            for key in ("id", "session_id", "device_id"):
+                if key in row and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(row[key])):
+                    raise ValueError("Invalid backup identifier")
+        for seg in req.audio_segments or []:
+            for key in ("id", "session_id", "seq_index", "start_time", "end_time", "duration_ms",
+                        "peak_db", "avg_db", "file_hash", "file_size_bytes", "created_at"):
+                if key not in seg:
+                    raise ValueError("Missing segment metadata")
+            ext = seg.get("audio_ext", ".wav")
+            if ext not in (".wav", ".m4a", ".aac"):
+                raise ValueError("Invalid audio extension")
+            target = (AUDIO_STORAGE_DIR / seg["session_id"] / (seg["id"] + ext)).resolve()
+            if not target.is_relative_to(AUDIO_STORAGE_DIR.resolve()):
+                raise ValueError("Audio path escapes storage")
+            if seg.get("audio_base64"):
+                raw = base64.b64decode(seg["audio_base64"], validate=True)
+                if len(raw) > MAX_UPLOAD_BYTES or len(raw) != seg["file_size_bytes"]:
+                    raise ValueError("Invalid backup audio size")
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), seg["file_hash"]):
+                    raise ValueError("Backup audio checksum mismatch")
+                if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != seg["file_hash"]:
+                    raise ValueError("Backup would overwrite different audio")
+                prepared_audio[seg["id"]] = raw
+            elif not target.exists() or hashlib.sha256(target.read_bytes()).hexdigest() != seg["file_hash"]:
+                raise ValueError("Backup audio bytes are missing")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     conn = get_db_conn()
     conn.execute("PRAGMA foreign_keys=OFF;")
     restored_devices = 0
@@ -1363,7 +1538,7 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                 ext = seg.get("audio_ext", ".wav")
                 dest_path = sess_dir / f"{seg['id']}{ext}"
                 if seg.get("audio_base64"):
-                    raw_bytes = base64.b64decode(seg["audio_base64"])
+                    raw_bytes = prepared_audio[seg["id"]]
                     dest_path.write_bytes(raw_bytes)
                 conn.execute(
                     """INSERT OR REPLACE INTO audio_segments (
@@ -1380,7 +1555,7 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                         seg["duration_ms"],
                         seg["peak_db"],
                         seg["avg_db"],
-                        seg.get("speech_confidence", 0.95),
+                        seg.get("speech_confidence", 0.0),
                         str(dest_path),
                         seg["file_hash"],
                         seg["file_size_bytes"],
@@ -1388,6 +1563,8 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                         seg.get("waveform_data", "[]"),
                     )
                 )
+                conn.execute("UPDATE audio_segments SET recording_kind = ? WHERE id = ?",
+                             (seg.get("recording_kind", "speech"), seg["id"]))
                 restored_segments += 1
 
             record_event(conn, "STORAGE_BACKUP_RESTORED", None, {
@@ -1450,6 +1627,8 @@ def get_audit_logs(limit: int = 50, auth: dict = Depends(verify_admin_token)):
 
 @app.post("/api/v1/storage/cleanup")
 def cleanup_old_recordings(max_age_days: float = 30.0, auth: dict = Depends(verify_admin_token)):
+    if not math.isfinite(max_age_days) or max_age_days < 1:
+        raise HTTPException(status_code=400, detail="Retention must be at least one day")
     cutoff = time.time() - (max_age_days * 86400.0)
     conn = get_db_conn()
     rows = conn.execute("SELECT id, file_path, session_id FROM audio_segments WHERE created_at < ?", (cutoff,)).fetchall()
@@ -1461,6 +1640,7 @@ def cleanup_old_recordings(max_age_days: float = 30.0, auth: dict = Depends(veri
             except Exception:
                 pass
         conn.execute("DELETE FROM audio_segments WHERE id = ?", (r["id"],))
+        conn.execute("UPDATE sessions SET total_speech_segments = MAX(0, total_speech_segments - 1) WHERE id = ?", (r["session_id"],))
         removed += 1
     conn.commit()
     conn.close()
@@ -1478,6 +1658,8 @@ def health_check():
     latency_ms = round((time.time() - start) * 1000, 2)
     return {
         "status": "healthy",
+        "instance_id": INSTANCE_ID,
+        "synthetic_test_only": os.environ.get("SYNTHETIC_TEST_ONLY") == "1",
         "version": "3.0.0",
         "db_latency_ms": latency_ms,
         "uptime": time.time(),
@@ -1493,3 +1675,13 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8001"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+
+@app.get("/api/v1/testing/sample")
+def synthetic_test_sample():
+    if os.environ.get("SYNTHETIC_TEST_ONLY") != "1":
+        raise HTTPException(status_code=404, detail="Test mode is disabled")
+    from backend.synthetic_fixture import synthetic_wav
+    return Response(synthetic_wav(), media_type="audio/wav", headers={
+        "Content-Disposition": 'attachment; filename="synthetic_test.wav"',
+        "Cache-Control": "no-store"})

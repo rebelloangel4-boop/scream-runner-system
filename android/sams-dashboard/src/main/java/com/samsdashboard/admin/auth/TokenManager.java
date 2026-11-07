@@ -69,7 +69,7 @@ public class TokenManager {
                 return Base64.encodeToString(iv, Base64.NO_WRAP) + ":" + Base64.encodeToString(cipherText, Base64.NO_WRAP);
             } catch (Exception ignored) {}
         }
-        return Base64.encodeToString(plain.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+        throw new IllegalStateException("Secure credential storage unavailable; unlock this phone and retry");
     }
 
     private String decrypt(String stored) {
@@ -90,11 +90,8 @@ public class TokenManager {
                 return null;
             }
         }
-        try {
-            return new String(Base64.decode(stored, Base64.NO_WRAP), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return null;
-        }
+        return null; // Never accept legacy plaintext/base64 credentials.
+
     }
 
     public void saveTokens(String accessToken, String refreshToken, String username) {
