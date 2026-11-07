@@ -171,7 +171,9 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         settingsBtn.setOnClickListener(v -> showSettingsAndBatteryDialog());
         controlsBar.addView(settingsBtn);
 
-        hudLayout.addView(controlsBar);
+        android.widget.HorizontalScrollView controlsScroll = new android.widget.HorizontalScrollView(this);
+        controlsScroll.addView(controlsBar);
+        hudLayout.addView(controlsScroll);
         rootLayout.addView(hudLayout);
 
         setContentView(rootLayout);
@@ -201,7 +203,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     }
 
     private void playSynthesizedSfx(final int freqStart, final int freqEnd, final int durationMs) {
-        if (soundMuted) return;
+        if (soundMuted || sfxExecutor.isShutdown()) return;
         sfxExecutor.execute(() -> {
             AudioTrack track = null;
             try {
@@ -288,7 +290,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
             Toast.makeText(this, "Stop recording before reviewing and sharing", Toast.LENGTH_LONG).show(); return;
         }
         List<File> files = SmartRecordingService.getInstance(this).listLocalClips();
-        files.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        java.util.Collections.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
         String[] names = new String[files.size()];
         for (int i = 0; i < files.size(); i++) names[i] = files.get(i).getName();
         new AlertDialog.Builder(this).setTitle("Choose a local recording to review")
@@ -509,7 +511,6 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void activateConsentedSession() {
         currentSessionId = "sess_android_" + (System.currentTimeMillis() / 1000);
-        CoordinatedAudioManager.getInstance().registerGameplayListener(this);
         SmartRecordingService.getInstance(this).startSession(currentSessionId);
         isRecordingActive = true;
         recordToggleButton.setText("● STOP REC");
@@ -521,6 +522,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     private void stopActiveConsentSession(String reason) {
         SmartRecordingService.getInstance(this).stopSession();
+        stopService(new Intent(this, SmartRecordingService.class));
         CoordinatedAudioManager.getInstance().unregisterGameplayListener(this);
         CoordinatedAudioManager.getInstance().stopCapture();
         isRecordingActive = false;
@@ -534,6 +536,27 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         if (reason != null) {
             Toast.makeText(this, reason, Toast.LENGTH_SHORT).show();
         }
+    }
+
+    private final android.os.Handler recordingUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable recordingUiRefresh = new Runnable() {
+        @Override public void run() {
+            boolean active = SmartRecordingService.getInstance(MainActivity.this).isActive();
+            isRecordingActive = active;
+            userExplicitlyConsented = active;
+            recordToggleButton.setText(active ? "● STOP REC" : "VOICE + REC (CONSENT)");
+            if (active) {
+                CoordinatedAudioManager.getInstance().registerGameplayListener(MainActivity.this);
+            } else {
+                CoordinatedAudioManager.getInstance().unregisterGameplayListener(MainActivity.this);
+                micDbText.setText("MIC: OFF (TOUCH MODE)");
+            }
+            recordingUiHandler.postDelayed(this, 500);
+        }
+    };
+
+    @Override public void onAudioError(String message) {
+        runOnUiThread(() -> stopActiveConsentSession("Microphone stopped: " + message));
     }
 
     private long lastUiMicUpdateMs = 0;
@@ -635,6 +658,8 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     protected void onResume() {
         super.onResume();
         gameView.resumeLoop();
+        recordingUiHandler.post(recordingUiRefresh);
+        AudioUploadWorker.setStatusListener(this);
         AudioUploadWorker.flushPendingQueue(this);
     }
 
@@ -642,6 +667,9 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
     protected void onPause() {
         super.onPause();
         gameView.pauseLoop();
+        recordingUiHandler.removeCallbacks(recordingUiRefresh);
+        CoordinatedAudioManager.getInstance().unregisterGameplayListener(this);
+        AudioUploadWorker.setStatusListener(null);
         if (isRecordingActive && !keepRecordingWhenBackgrounded) {
             stopActiveConsentSession(null);
         }
@@ -649,9 +677,13 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
 
     @Override
     protected void onDestroy() {
-        if (isRecordingActive) {
+        if (isRecordingActive && !keepRecordingWhenBackgrounded) {
             stopActiveConsentSession(null);
         }
+        recordingUiHandler.removeCallbacksAndMessages(null);
+        CoordinatedAudioManager.getInstance().unregisterGameplayListener(this);
+        AudioUploadWorker.setStatusListener(null);
+        gameView.pauseLoop();
         sfxExecutor.shutdownNow();
         super.onDestroy();
     }
@@ -1098,7 +1130,7 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
         }
 
         public void resumeLoop() {
-            if (isRunningLoop) return;
+            if (isRunningLoop || (gameThread != null && gameThread.isAlive())) return;
             isRunningLoop = true;
             gameThread = new Thread(this, "ScreamRunnerRenderThread");
             gameThread.start();
@@ -1108,8 +1140,9 @@ public class MainActivity extends Activity implements CoordinatedAudioManager.Au
             isRunningLoop = false;
             try {
                 if (gameThread != null) {
+                    gameThread.interrupt();
                     gameThread.join(400);
-                    gameThread = null;
+                    if (!gameThread.isAlive()) gameThread = null;
                 }
             } catch (InterruptedException ignored) {}
         }

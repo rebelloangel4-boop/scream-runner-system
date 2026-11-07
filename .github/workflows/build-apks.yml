@@ -44,6 +44,8 @@ jobs:
           python -m pip install -r backend/requirements.txt httpx
           python -m unittest discover -s tests -v
           python tests/run_http_smoke.py
+      - name: Android lint and regression APK compilation
+        run: bash android/gradlew -p android --no-daemon --console=plain lintDebug assembleDebugAndroidTest
       - name: Build both debug APKs
         run: |
           chmod +x android/gradlew scripts/build_apks.sh

@@ -7,10 +7,11 @@ android {
 
     defaultConfig {
         applicationId "com.screamrunner.arcade"
+        testInstrumentationRunner "com.screamrunner.game.RegressionInstrumentation"
         minSdk 23
         targetSdk 34
-        versionCode 8
-        versionName "3.0.2-test"
+        versionCode 9
+        versionName "3.0.3-rc1"
     }
 
     buildTypes {
@@ -45,3 +46,5 @@ android {
 dependencies {
     // Zero third-party libraries: uses pure Android SDK (HttpURLConnection, org.json, AudioRecord, Canvas)
 }
+
+apply from: rootProject.file("release-signing.gradle")

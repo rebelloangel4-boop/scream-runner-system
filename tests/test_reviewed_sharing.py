@@ -109,6 +109,14 @@ class ReviewedSharingTests(unittest.TestCase):
         self.assertEqual(first.json()['segment_id'], second.json()['segment_id'])
         self.assertEqual(second.json()['status'],'already_exists')
 
+    def test_identical_audio_at_different_times_is_preserved(self):
+        session = 'repeat_' + secrets.token_hex(6)
+        first = self.upload(session=session).json()
+        second = self.upload(session=session, extra={'seq_index':'2', 'start_time':'1001', 'end_time':'1002'}).json()
+        self.assertNotEqual(first['segment_id'], second['segment_id'])
+        rows = self.client.get(f'/api/v1/sessions/{session}/segments', headers=self.admin).json()['segments']
+        self.assertEqual(len(rows), 2)
+
     def test_full_recording_metadata_is_preserved(self):
         session = 'session_' + secrets.token_hex(6)
         self.assertEqual(self.upload(session=session, extra={'recording_kind':'full'}).status_code,200)
@@ -145,5 +153,61 @@ class ReviewedSharingTests(unittest.TestCase):
 
     def test_compressed_audio_not_misread_as_pcm(self):
         self.assertEqual(main.compute_waveform_from_wav_bytes(b'not a wav header'), '[]')
+
+    def test_waveform_includes_last_sample(self):
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as audio:
+            audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(16000)
+            audio.writeframes(b'\x00\x00' * 50 + b'\xff\x7f')
+        self.assertGreater(json.loads(main.compute_waveform_from_wav_bytes(buffer.getvalue()))[-1], 0.7)
+
+    def test_backup_rejects_path_traversal_before_mutation(self):
+        response = self.client.post('/api/v1/storage/restore', headers=self.admin,
+            json={'devices': [{'id': '../escape', 'name': 'bad'}]})
+        self.assertEqual(response.status_code, 400)
+
+    def test_backup_round_trip_preserves_kind_and_hash(self):
+        session = 'backup_' + secrets.token_hex(6)
+        uploaded = self.upload(session=session, extra={'recording_kind': 'full'}).json()
+        snapshot = self.client.get('/api/v1/storage/backup', headers=self.admin).json()
+        snapshot['audio_segments'] = [x for x in snapshot['audio_segments'] if x['id'] == uploaded['segment_id']]
+        response = self.client.post('/api/v1/storage/restore', headers=self.admin, json=snapshot)
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = self.client.get(f'/api/v1/sessions/{session}/segments', headers=self.admin).json()['segments']
+        self.assertEqual(rows[0]['recording_kind'], 'full')
+        snapshot['audio_segments'][0]['file_hash'] = '0' * 64
+        self.assertEqual(self.client.post('/api/v1/storage/restore', headers=self.admin, json=snapshot).status_code, 400)
+        result = self.client.get('/api/v1/audio/' + uploaded['segment_id'] + '/download', headers=self.admin)
+        self.assertEqual(result.content, self.wav)
+
+    def test_rejects_truncated_and_fake_audio(self):
+        from fastapi import HTTPException
+        for content, ext in ((b'not audio', '.wav'), (self.wav[:-2], '.wav'), (b'not audio', '.m4a'), (b'garbage', '.aac'), (self.wav, '.exe')):
+            with self.subTest(ext=ext, size=len(content)):
+                with self.assertRaises(HTTPException): main.validate_audio_container(content, ext)
+
+    def test_expired_and_missing_expiry_tokens_rejected(self):
+        import jwt
+        expired = main.create_jwt_token('testadmin', expires_in_seconds=-1)
+        self.assertEqual(self.client.get('/api/v1/sessions', headers={'Authorization':'Bearer '+expired}).status_code, 401)
+        claims = jwt.decode(self.admin['Authorization'][7:], main.JWT_SECRET, algorithms=['HS256'])
+        claims.pop('exp')
+        token = jwt.encode(claims, main.JWT_SECRET, algorithm='HS256')
+        self.assertEqual(self.client.get('/api/v1/sessions', headers={'Authorization':'Bearer '+token}).status_code, 401)
+
+    def test_password_change_invalidates_access_and_refresh(self):
+        with main.get_db_conn() as conn:
+            original = conn.execute("SELECT updated_at FROM admin_users WHERE username = 'testadmin'").fetchone()[0]
+            conn.execute("UPDATE admin_users SET updated_at = ? WHERE username = 'testadmin'", (original + 1,))
+        try:
+            self.assertEqual(self.client.get('/api/v1/sessions', headers=self.admin).status_code, 401)
+            self.assertEqual(self.client.post('/api/v1/auth/refresh', json={'refresh_token':self.refresh}).status_code, 401)
+        finally:
+            with main.get_db_conn() as conn:
+                conn.execute("UPDATE admin_users SET updated_at = ? WHERE username = 'testadmin'", (original,))
+
+    def test_invalid_retention_cannot_delete_recordings(self):
+        for age in ('-1', '0', 'nan'):
+            self.assertEqual(self.client.post('/api/v1/storage/cleanup?max_age_days='+age, headers=self.admin).status_code, 400)
 
 if __name__ == '__main__': unittest.main()

@@ -123,6 +123,9 @@ public class AudioEncoder {
                     }
                 }
             }
+            if (!muxerStarted) throw new IOException("AAC encoder produced no track");
+            muxer.stop();
+            muxerStarted = false;
             return outputFile.exists() && outputFile.length() > 128;
         } finally {
             if (codec != null) {
@@ -212,12 +215,12 @@ public class AudioEncoder {
         int totalSamples = pcmData.length / 2;
         if (totalSamples == 0) return "[]";
 
-        int samplesPerBar = Math.max(1, totalSamples / numBars);
+        numBars = Math.max(1, Math.min(numBars, totalSamples));
         StringBuilder sb = new StringBuilder("[");
 
         for (int bar = 0; bar < numBars; bar++) {
-            int start = bar * samplesPerBar;
-            int end = Math.min(start + samplesPerBar, totalSamples);
+            int start = bar * totalSamples / numBars;
+            int end = (bar + 1) * totalSamples / numBars;
             double sumSq = 0;
             int count = 0;
 

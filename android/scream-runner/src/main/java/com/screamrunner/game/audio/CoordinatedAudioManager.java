@@ -21,11 +21,12 @@ public class CoordinatedAudioManager {
 
     public interface AudioFrameListener {
         void onAudioFrame(short[] buffer, int readSamples, double measuredDb);
+        default void onAudioError(String message) {}
     }
 
     private static CoordinatedAudioManager instance;
 
-    private AudioRecord audioRecord;
+    private volatile AudioRecord audioRecord;
     private Thread captureThread;
     private final AtomicBoolean isCapturing = new AtomicBoolean(false);
     private int bufferSize;
@@ -86,22 +87,22 @@ public class CoordinatedAudioManager {
             );
 
             if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize.");
-                return;
+                throw new IllegalStateException("Microphone could not initialize");
             }
 
             audioRecord.startRecording();
             isCapturing.set(true);
 
-            captureThread = new Thread(this::captureLoop, "AudioCaptureThread");
+            final AudioRecord source = audioRecord;
+            captureThread = new Thread(() -> captureLoop(source), "AudioCaptureThread");
             captureThread.setPriority(Thread.MAX_PRIORITY);
             captureThread.start();
             Log.i(TAG, "Audio capture loop started successfully at " + SAMPLE_RATE + "Hz");
 
         } catch (SecurityException e) {
-            Log.e(TAG, "RECORD_AUDIO permission missing or denied.", e);
+            releaseFailedStart("Microphone permission missing or denied");
         } catch (Exception e) {
-            Log.e(TAG, "Error starting AudioRecord capture.", e);
+            releaseFailedStart("Microphone unavailable: " + e.getMessage());
         }
     }
 
@@ -111,63 +112,63 @@ public class CoordinatedAudioManager {
         }
     }
 
-    public synchronized void stopCapture() {
+    private void releaseFailedStart(String message) {
+        AudioRecord failed = audioRecord;
+        audioRecord = null;
         isCapturing.set(false);
-        if (captureThread != null) {
-            captureThread.interrupt();
-            captureThread = null;
-        }
-        if (audioRecord != null) {
-            try {
-                if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord.stop();
-                }
-                audioRecord.release();
-            } catch (Exception e) {
-                Log.e(TAG, "Error releasing AudioRecord", e);
-            } finally {
-                audioRecord = null;
-            }
-        }
-        Log.i(TAG, "Audio capture stopped and microphone released.");
+        if (failed != null) try { failed.release(); } catch (Exception ignored) {}
+        notifyError(message);
     }
 
-    private void captureLoop() {
-        short[] buffer = new short[512]; // ~32ms frame at 16kHz
+    private void notifyError(String message) {
+        for (AudioFrameListener l : recordingListeners) l.onAudioError(message);
+        for (AudioFrameListener l : gameplayListeners) l.onAudioError(message);
+    }
 
-        while (isCapturing.get() && !Thread.currentThread().isInterrupted()) {
-            int read = audioRecord.read(buffer, 0, buffer.length);
-            if (read > 0) {
-                // Calculate real measured RMS decibel
+    public synchronized void stopCapture() {
+        isCapturing.set(false);
+        AudioRecord source = audioRecord;
+        audioRecord = null;
+        Thread old = captureThread;
+        captureThread = null;
+        if (old != null) old.interrupt();
+        // stop() unblocks read(); the capture thread alone releases its own source.
+        if (source != null) try { source.stop(); } catch (Exception ignored) {}
+    }
+
+    private void captureLoop(AudioRecord source) {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+        short[] buffer = new short[512];
+        try {
+            while (audioRecord == source && !Thread.currentThread().isInterrupted()) {
+                int read = source.read(buffer, 0, buffer.length);
+                if (audioRecord != source) break;
+                if (read < 0) throw new IllegalStateException("Microphone read failed: " + read);
+                if (read == 0) continue;
                 double sum = 0;
-                for (int i = 0; i < read; i++) {
-                    sum += buffer[i] * buffer[i];
-                }
+                for (int i = 0; i < read; i++) sum += (double) buffer[i] * buffer[i];
                 double rms = Math.sqrt(sum / read);
-                // Standard audio dBFS reference: 20 * log10(rms / 32768)
-                double measuredDb = (rms > 1) ? (20.0 * Math.log10(rms / 32767.0)) : -96.0;
-
-                // Dispatch to local gameplay listeners
+                double measuredDb = rms > 0 ? Math.max(-96, 20 * Math.log10(rms / 32768.0)) : -96;
                 for (AudioFrameListener l : gameplayListeners) {
-                    try {
-                        l.onAudioFrame(buffer, read, measuredDb);
-                    } catch (Exception e) {
-                        Log.e(TAG, "Error in gameplay listener", e);
-                    }
+                    if (audioRecord != source) break;
+                    l.onAudioFrame(buffer, read, measuredDb);
                 }
-
-                // Dispatch to authorized recording VAD listeners
                 for (AudioFrameListener l : recordingListeners) {
-                    try {
-                        l.onAudioFrame(buffer, read, measuredDb);
-                    } catch (Exception e) {
-                        Log.e(TAG, "Error in recording listener", e);
-                    }
+                    if (audioRecord != source) break;
+                    l.onAudioFrame(buffer, read, measuredDb);
                 }
-            } else if (read == AudioRecord.ERROR_INVALID_OPERATION || read == AudioRecord.ERROR_BAD_VALUE) {
-                Log.e(TAG, "AudioRecord read error: " + read);
-                break;
             }
+        } catch (Exception e) {
+            if (audioRecord == source) notifyError(e.getMessage());
+        } finally {
+            synchronized (this) {
+                if (audioRecord == source) {
+                    audioRecord = null;
+                    isCapturing.set(false);
+                }
+            }
+            try { source.stop(); } catch (Exception ignored) {}
+            try { source.release(); } catch (Exception ignored) {}
         }
     }
 

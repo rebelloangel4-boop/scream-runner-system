@@ -99,9 +99,9 @@ public class AudioWaveformView extends View {
 
             // Highlight bar color if peak loudness > -10 dB
             if (isHighlight && amp > 0.65f) {
-                canvas.drawRoundRect(new RectF(left, top, right, bottom), 4, 4, highlightPaint);
+                canvas.drawRoundRect(left, top, right, bottom, 4, 4, highlightPaint);
             } else {
-                canvas.drawRoundRect(new RectF(left, top, right, bottom), 4, 4, barPaint);
+                canvas.drawRoundRect(left, top, right, bottom, 4, 4, barPaint);
             }
         }
 

@@ -946,7 +946,7 @@ public class DashboardActivity extends Activity {
     protected void onDestroy() {
         autoSyncActive = false;
         mainHandler.removeCallbacks(syncRunnable);
-        playerController.stop();
+        playerController.release();
         super.onDestroy();
     }
 }

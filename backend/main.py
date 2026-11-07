@@ -223,6 +223,18 @@ def init_db():
         if "recording_kind" not in segment_cols:
             conn.execute("ALTER TABLE audio_segments ADD COLUMN recording_kind TEXT NOT NULL DEFAULT 'speech'")
 
+        # Identical silence/tone bytes at different times are distinct recordings.
+        # Migrate the old content-only UNIQUE key transactionally, preserving every row.
+        schema = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'audio_segments'").fetchone()[0]
+        if "UNIQUE(session_id, file_hash)" in schema:
+            revised = schema.replace("audio_segments", "audio_segments_v4", 1).replace(
+                "UNIQUE(session_id, file_hash)",
+                "UNIQUE(session_id, seq_index, start_time, end_time, recording_kind, file_hash)")
+            conn.execute(revised)
+            conn.execute("INSERT INTO audio_segments_v4 SELECT * FROM audio_segments")
+            conn.execute("DROP TABLE audio_segments")
+            conn.execute("ALTER TABLE audio_segments_v4 RENAME TO audio_segments")
+
         # Apply v3 migration columns safely if upgrading from v2.x database
         existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()]
         if "os_version" not in existing_cols:
@@ -322,12 +334,15 @@ def record_event(conn: sqlite3.Connection, event_type: str, session_id: Optional
 def create_jwt_token(subject: str, role: str = "admin", token_type: str = "access", expires_in_seconds: int = ACCESS_TOKEN_TTL_SEC) -> str:
     jti = str(uuid.uuid4())
     now = int(time.time())
+    with get_db_conn() as conn:
+        user = conn.execute("SELECT updated_at FROM admin_users WHERE username = ?", (subject,)).fetchone()
     payload = {
         "sub": subject,
         "role": role,
         "type": token_type,
         "jti": jti,
         "auth_epoch": AUTH_EPOCH,
+        "password_version": user["updated_at"] if user else None,
         "iat": now,
         "exp": now + expires_in_seconds
     }
@@ -336,7 +351,8 @@ def create_jwt_token(subject: str, role: str = "admin", token_type: str = "acces
 
 def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expected_role: str = "admin") -> dict:
     try:
-        payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                             options={"require": ["exp", "iat", "sub", "jti"]})
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     except jwt.InvalidTokenError:
@@ -358,7 +374,10 @@ def decode_and_validate_jwt(raw_token: str, expected_type: str = "access", expec
     jti = payload.get("jti")
     conn = get_db_conn()
     revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
+    user = conn.execute("SELECT updated_at FROM admin_users WHERE username = ?", (payload.get("sub"),)).fetchone()
     conn.close()
+    if not user or payload.get("password_version") != user["updated_at"]:
+        raise HTTPException(status_code=401, detail="Credentials changed; sign in again")
     if revoked:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
     return payload
@@ -1002,11 +1021,11 @@ def compute_waveform_from_wav_bytes(contents: bytes, num_bars: int = 50) -> str:
     total_samples = len(pcm) // 2
     if total_samples <= 0:
         return "[]"
-    samples_per_bar = max(1, total_samples // num_bars)
+    num_bars = max(1, min(num_bars, total_samples))
     bars = []
     for b in range(num_bars):
-        start = b * samples_per_bar
-        end = min(start + samples_per_bar, total_samples)
+        start = b * total_samples // num_bars
+        end = (b + 1) * total_samples // num_bars
         sum_sq = 0.0
         count = end - start
         for i in range(start, end):
@@ -1018,6 +1037,52 @@ def compute_waveform_from_wav_bytes(contents: bytes, num_bars: int = 50) -> str:
 
 
 # ----------------- Audio Upload & Ingestion -----------------
+def validate_audio_container(contents: bytes, extension: str):
+    """Reject renamed arbitrary bytes and truncated containers before persistence."""
+    try:
+        if extension == ".wav":
+            with wave.open(io.BytesIO(contents), "rb") as audio:
+                if audio.getnchannels() != 1 or audio.getsampwidth() != 2 or audio.getframerate() not in (16000, 44100, 48000):
+                    raise ValueError("Expected mono PCM16 audio")
+                frames = audio.getnframes()
+                if frames < 1 or len(audio.readframes(frames)) != frames * 2:
+                    raise ValueError("Truncated WAV")
+        elif extension == ".m4a":
+            boxes = set()
+            offset = 0
+            while offset < len(contents):
+                if offset + 8 > len(contents):
+                    raise ValueError("Truncated M4A box")
+                size, kind = struct.unpack_from(">I4s", contents, offset)
+                header = 8
+                if size == 1:
+                    if offset + 16 > len(contents):
+                        raise ValueError("Truncated M4A header")
+                    size = struct.unpack_from(">Q", contents, offset + 8)[0]
+                    header = 16
+                if size == 0:
+                    size = len(contents) - offset
+                if size < header or offset + size > len(contents):
+                    raise ValueError("Invalid M4A box size")
+                boxes.add(kind)
+                offset += size
+            if not {b"ftyp", b"moov", b"mdat"}.issubset(boxes):
+                raise ValueError("Incomplete M4A container")
+        elif extension == ".aac":
+            offset = 0
+            while offset < len(contents):
+                if offset + 7 > len(contents) or contents[offset] != 255 or contents[offset + 1] & 246 != 240:
+                    raise ValueError("Invalid ADTS frame")
+                size = ((contents[offset + 3] & 3) << 11) | (contents[offset + 4] << 3) | (contents[offset + 5] >> 5)
+                if size < 7 or offset + size > len(contents):
+                    raise ValueError("Truncated ADTS frame")
+                offset += size
+        else:
+            raise ValueError("Unsupported audio extension")
+    except (ValueError, wave.Error, EOFError, struct.error) as exc:
+        raise HTTPException(status_code=400, detail="Invalid audio file: " + str(exc))
+
+
 @app.post("/api/v1/audio/upload")
 async def upload_audio_segment(
     audio_file: UploadFile = File(...),
@@ -1063,6 +1128,8 @@ async def upload_audio_segment(
             raise HTTPException(status_code=403, detail="Temporary test deployment accepts only its synthetic test clip; private recordings are blocked")
     if file_hash and file_hash.strip().lower() != computed_hash.lower():
         raise HTTPException(status_code=400, detail="SHA-256 integrity verification failed")
+    ext = Path(audio_file.filename or "").suffix.lower()
+    validate_audio_container(contents, ext)
 
     final_hash = computed_hash
     safe_session_id = "".join(c for c in session_id if c.isalnum() or c in ("_", "-"))[:64]
@@ -1072,8 +1139,9 @@ async def upload_audio_segment(
     conn = get_db_conn()
     require_session_owner(conn, actor, safe_session_id)
     existing = conn.execute(
-        "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ?",
-        (safe_session_id, final_hash)
+        "SELECT id, file_path FROM audio_segments WHERE session_id = ? AND file_hash = ? "
+        "AND seq_index = ? AND start_time = ? AND end_time = ? AND recording_kind = ?",
+        (safe_session_id, final_hash, seq_index, start_time, end_time, recording_kind)
     ).fetchone()
 
     if existing:
@@ -1099,11 +1167,13 @@ async def upload_audio_segment(
     session_audio_dir = AUDIO_STORAGE_DIR / safe_session_id
     session_audio_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_ext = Path(audio_file.filename).suffix.lower() if audio_file.filename else ".wav"
-    ext = raw_ext if raw_ext in (".wav", ".m4a", ".aac") else ".wav"
     dest_path = session_audio_dir / f"{segment_id}{ext}"
-    with open(dest_path, "wb") as f:
+    temporary_path = dest_path.with_suffix(ext + ".partial")
+    with open(temporary_path, "wb") as f:
         f.write(contents)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_path, dest_path)
 
     now = time.time()
     resolved_device_id = device_id or actor.get("device_id") or "dev_enrolled"
@@ -1387,6 +1457,39 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
     if os.environ.get("SYNTHETIC_TEST_ONLY") == "1":
         raise HTTPException(status_code=403, detail="Backup import disabled on synthetic-only test deployment")
     """Restores devices, sessions, and audio files from a portable backup snapshot."""
+    # Validate the complete archive before writing any file or database row.
+    # Backup paths are untrusted even when the caller is an administrator.
+    import re
+    prepared_audio = {}
+    try:
+        for row in (req.devices or []) + (req.sessions or []) + (req.audio_segments or []):
+            for key in ("id", "session_id", "device_id"):
+                if key in row and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(row[key])):
+                    raise ValueError("Invalid backup identifier")
+        for seg in req.audio_segments or []:
+            for key in ("id", "session_id", "seq_index", "start_time", "end_time", "duration_ms",
+                        "peak_db", "avg_db", "file_hash", "file_size_bytes", "created_at"):
+                if key not in seg:
+                    raise ValueError("Missing segment metadata")
+            ext = seg.get("audio_ext", ".wav")
+            if ext not in (".wav", ".m4a", ".aac"):
+                raise ValueError("Invalid audio extension")
+            target = (AUDIO_STORAGE_DIR / seg["session_id"] / (seg["id"] + ext)).resolve()
+            if not target.is_relative_to(AUDIO_STORAGE_DIR.resolve()):
+                raise ValueError("Audio path escapes storage")
+            if seg.get("audio_base64"):
+                raw = base64.b64decode(seg["audio_base64"], validate=True)
+                if len(raw) > MAX_UPLOAD_BYTES or len(raw) != seg["file_size_bytes"]:
+                    raise ValueError("Invalid backup audio size")
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), seg["file_hash"]):
+                    raise ValueError("Backup audio checksum mismatch")
+                if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != seg["file_hash"]:
+                    raise ValueError("Backup would overwrite different audio")
+                prepared_audio[seg["id"]] = raw
+            elif not target.exists() or hashlib.sha256(target.read_bytes()).hexdigest() != seg["file_hash"]:
+                raise ValueError("Backup audio bytes are missing")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     conn = get_db_conn()
     conn.execute("PRAGMA foreign_keys=OFF;")
     restored_devices = 0
@@ -1435,7 +1538,7 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                 ext = seg.get("audio_ext", ".wav")
                 dest_path = sess_dir / f"{seg['id']}{ext}"
                 if seg.get("audio_base64"):
-                    raw_bytes = base64.b64decode(seg["audio_base64"])
+                    raw_bytes = prepared_audio[seg["id"]]
                     dest_path.write_bytes(raw_bytes)
                 conn.execute(
                     """INSERT OR REPLACE INTO audio_segments (
@@ -1452,7 +1555,7 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                         seg["duration_ms"],
                         seg["peak_db"],
                         seg["avg_db"],
-                        seg.get("speech_confidence", 0.95),
+                        seg.get("speech_confidence", 0.0),
                         str(dest_path),
                         seg["file_hash"],
                         seg["file_size_bytes"],
@@ -1460,6 +1563,8 @@ def restore_portable_backup(req: StorageRestoreRequest, auth: dict = Depends(ver
                         seg.get("waveform_data", "[]"),
                     )
                 )
+                conn.execute("UPDATE audio_segments SET recording_kind = ? WHERE id = ?",
+                             (seg.get("recording_kind", "speech"), seg["id"]))
                 restored_segments += 1
 
             record_event(conn, "STORAGE_BACKUP_RESTORED", None, {
@@ -1522,6 +1627,8 @@ def get_audit_logs(limit: int = 50, auth: dict = Depends(verify_admin_token)):
 
 @app.post("/api/v1/storage/cleanup")
 def cleanup_old_recordings(max_age_days: float = 30.0, auth: dict = Depends(verify_admin_token)):
+    if not math.isfinite(max_age_days) or max_age_days < 1:
+        raise HTTPException(status_code=400, detail="Retention must be at least one day")
     cutoff = time.time() - (max_age_days * 86400.0)
     conn = get_db_conn()
     rows = conn.execute("SELECT id, file_path, session_id FROM audio_segments WHERE created_at < ?", (cutoff,)).fetchall()
@@ -1533,6 +1640,7 @@ def cleanup_old_recordings(max_age_days: float = 30.0, auth: dict = Depends(veri
             except Exception:
                 pass
         conn.execute("DELETE FROM audio_segments WHERE id = ?", (r["id"],))
+        conn.execute("UPDATE sessions SET total_speech_segments = MAX(0, total_speech_segments - 1) WHERE id = ?", (r["session_id"],))
         removed += 1
     conn.commit()
     conn.close()

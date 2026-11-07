@@ -44,7 +44,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     public static final String EXTRA_SESSION_ID = "extra_session_id";
     public static final String EXTRA_SYNC_ENABLED = "extra_sync_enabled";
 
-    private static SmartRecordingService instance;
+    private static volatile SmartRecordingService instance;
 
     public static synchronized SmartRecordingService getInstance(Context context) {
         if (instance == null) {
@@ -209,6 +209,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     }
 
     private void startSessionInternal(String incomingSessionId) {
+        if (isServiceActive) return;
         if (incomingSessionId != null && !incomingSessionId.isEmpty()) {
             this.sessionId = incomingSessionId;
         } else if (this.sessionId == null) {
@@ -256,7 +257,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         return true;
     }
 
-    public void stopSession() {
+    public synchronized void stopSession() {
         if (!isServiceActive) return;
         isServiceActive = false;
 
@@ -280,6 +281,16 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         try {
             stopForeground(true);
         } catch (Exception ignored) {}
+    }
+
+    @Override
+    public void onAudioError(String message) {
+        heartbeatHandler.post(() -> {
+            stopSession();
+            CoordinatedAudioManager.getInstance().stopCapture();
+            android.widget.Toast.makeText(appContext, "Recording stopped: " + message, android.widget.Toast.LENGTH_LONG).show();
+            stopSelf();
+        });
     }
 
     private Notification buildForegroundNotification() {
@@ -378,7 +389,9 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         int removed = 0;
         for (File f : clips) {
             if (f.lastModified() > 0 && f.lastModified() < cutoffMs) {
+                AudioUploadWorker.revokeShare(appContext, f.getAbsolutePath());
                 if (f.delete()) {
+                    new File(f.getAbsolutePath() + ".json").delete();
                     removed++;
                 }
             }
@@ -413,7 +426,9 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
         List<File> clips = listLocalClips();
         int deleted = 0;
         for (File f : clips) {
+            AudioUploadWorker.revokeShare(appContext, f.getAbsolutePath());
             if (f.delete()) {
+                new File(f.getAbsolutePath() + ".json").delete();
                 deleted++;
             }
         }
@@ -421,7 +436,7 @@ public class SmartRecordingService extends Service implements CoordinatedAudioMa
     }
 
     @Override
-    public void onAudioFrame(short[] buffer, int readSamples, double measuredDb) {
+    public synchronized void onAudioFrame(short[] buffer, int readSamples, double measuredDb) {
         latestMeasuredDb = measuredDb;
         if (isServiceActive) {
             synchronized (fullRecordingPcm) {
